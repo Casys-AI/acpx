@@ -590,3 +590,83 @@ test("quiet formatter emits final usage and cost metadata to stderr", () => {
     "[acpx] tokens: input=17030 output=4 cache_read=12 cache_write=3 total=17049\n[acpx] cost: 0.051276 USD\n",
   );
 });
+
+test("quiet formatter emits structured error line to stderr on onError (never swallows errors)", () => {
+  const stdout = new CaptureWriter();
+  const stderr = new CaptureWriter();
+  const formatter = createOutputFormatter("quiet", { stdout, stderr });
+
+  formatter.onError({
+    code: "RUNTIME",
+    detailCode: "QUEUE_RUNTIME_PROMPT_FAILED",
+    origin: "queue",
+    message: "rate limit exceeded",
+  });
+
+  // stdout must remain empty — the quiet contract only covers stdout
+  assert.equal(stdout.toString(), "");
+  // stderr must contain exactly one structured line, parseable by machines
+  assert.equal(
+    stderr.toString(),
+    "[acpx] error: RUNTIME QUEUE_RUNTIME_PROMPT_FAILED rate limit exceeded\n",
+  );
+});
+
+test("quiet formatter onError line uses code when detailCode is absent", () => {
+  const stdout = new CaptureWriter();
+  const stderr = new CaptureWriter();
+  const formatter = createOutputFormatter("quiet", { stdout, stderr });
+
+  formatter.onError({
+    code: "NO_SESSION",
+    message: "session not found",
+  });
+
+  assert.equal(stdout.toString(), "");
+  assert.equal(stderr.toString(), "[acpx] error: NO_SESSION session not found\n");
+});
+
+test("quiet formatter onError collapses multi-line message to a single stderr line", () => {
+  // A message containing \n would break a line-by-line parser reading stderr.
+  // The formatter must squash all newlines before interpolation.
+  const stdout = new CaptureWriter();
+  const stderr = new CaptureWriter();
+  const formatter = createOutputFormatter("quiet", { stdout, stderr });
+
+  formatter.onError({
+    code: "RUNTIME",
+    message: "line one\nline two\nline three",
+  });
+
+  assert.equal(stdout.toString(), "");
+  const stderrStr = stderr.toString();
+  // Exactly one non-empty line in the output.
+  assert.equal(
+    stderrStr.split("\n").filter(Boolean).length,
+    1,
+    "stderr must be a single line when the message contains embedded newlines",
+  );
+  assert.equal(stderrStr, "[acpx] error: RUNTIME line one line two line three\n");
+});
+
+test("quiet formatter onError collapses CRLF line endings in message to a single stderr line", () => {
+  // Windows-style \r\n line endings must be collapsed the same way as \n.
+  // A lone \r (old Mac style) is also normalised.
+  const stdout = new CaptureWriter();
+  const stderr = new CaptureWriter();
+  const formatter = createOutputFormatter("quiet", { stdout, stderr });
+
+  formatter.onError({
+    code: "RUNTIME",
+    message: "line one\r\nline two\r\nline three",
+  });
+
+  assert.equal(stdout.toString(), "");
+  const stderrStr = stderr.toString();
+  assert.equal(
+    stderrStr.split("\n").filter(Boolean).length,
+    1,
+    "stderr must be a single line when the message contains embedded CRLF newlines",
+  );
+  assert.equal(stderrStr, "[acpx] error: RUNTIME line one line two line three\n");
+});
