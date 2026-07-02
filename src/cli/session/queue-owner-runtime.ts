@@ -1,6 +1,6 @@
 import { AcpClient } from "../../acp/client.js";
 import { formatErrorMessage } from "../../acp/error-normalization.js";
-import { withTimeout } from "../../async-control.js";
+import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
 import { checkpointPerfMetricsCapture } from "../../perf-metrics-capture.js";
 import { setPerfGauge } from "../../perf-metrics.js";
 import { promptToDisplayText } from "../../prompt-content.js";
@@ -174,10 +174,21 @@ async function closeQueueOwnerRuntime(params: {
     clearInterval(params.heartbeatTimer);
   }
   params.turnController.beginClosing();
-  await params.owner?.close();
+  // Kill the bridge first — invariant: the bridge must never outlive the owner.
+  // The old order (owner.close() then sharedClient.close()) was wrong:
+  // owner.close() calls server.close() which waits for all active client
+  // sockets to drain.  A client in waitForCompletion that stayed connected
+  // would block the drain past the external 4 s SIGKILL grace period, so
+  // terminateProcess() would SIGKILL the owner before sharedClient.close()
+  // (which calls terminateAgentProcess) had a chance to run — orphaning the
+  // bridge.  By closing the bridge first we guarantee it is killed regardless
+  // of how long the IPC-server drain takes.
   await params.sharedClient.close().catch(() => {
     // best effort while queue owner is shutting down
   });
+  // SessionQueueOwner.close() now also destroys tracked client sockets so
+  // server.close() resolves promptly even when a client is still connected.
+  await params.owner?.close();
   await writeQueueOwnerLifecycleSnapshot(params.sessionId, params.sharedClient);
   await releaseQueueOwnerLease(params.lease);
   if (params.verbose) {
@@ -255,97 +266,126 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     }
   };
 
-  try {
-    owner = await SessionQueueOwner.start(
-      lease,
-      {
-        cancelPrompt: async () => {
-          const accepted = await turnController.requestCancel();
-          if (!accepted) {
-            return false;
-          }
-          await applyPendingCancel();
-          return true;
-        },
-        closeSession: async (timeoutMs?: number) => await closeActiveBackendSession(timeoutMs),
-        setSessionMode: async (modeId: string, timeoutMs?: number) => {
-          await turnController.setSessionMode(modeId, timeoutMs);
-        },
-        setSessionModel: async (modelId: string, timeoutMs?: number) =>
-          await turnController.setSessionModel(modelId, timeoutMs),
-        setSessionConfigOption: async (configId: string, value: string, timeoutMs?: number) => {
-          return await turnController.setSessionConfigOption(configId, value, timeoutMs);
-        },
-      },
-      {
-        maxQueueDepth,
-        onQueueDepthChanged: (queueDepth) => {
-          setPerfGauge("queue.owner.depth", queueDepth);
-          void refreshQueueOwnerLease(lease, { queueDepth }).catch(() => {
-            // best effort heartbeat refresh while owner is live
-          });
-        },
-      },
-    );
-
-    logQueueOwnerReady({
-      sessionId: options.sessionId,
-      ttlMs,
-      maxQueueDepth,
-      verbose: options.verbose,
-    });
-    await refreshQueueOwnerLease(lease, { queueDepth: owner.queueDepth() }).catch(() => {
-      // best effort initial heartbeat
-    });
-    heartbeatTimer = setInterval(() => {
-      void refreshQueueOwnerLease(lease, { queueDepth: owner?.queueDepth() ?? 0 }).catch(() => {
-        // best effort heartbeat
-      });
-    }, QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
-
-    let isFirstTask = true;
-    while (true) {
-      const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
-      const task = await owner.nextTask(pollTimeoutMs);
-      if (!task) {
-        break;
-      }
-      isFirstTask = false;
-
-      await runPromptTurn(async () => {
-        try {
-          await runQueuedTask(options.sessionId, task, {
-            sharedClient,
-            verbose: options.verbose,
-            mcpServers: options.mcpServers,
-            nonInteractivePermissions: options.nonInteractivePermissions,
-            authCredentials: options.authCredentials,
-            authPolicy: options.authPolicy,
-            suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
-            promptRetries: task.promptRetries ?? 0,
-            sessionOptions: options.sessionOptions,
-            onClientAvailable: setActiveController,
-            onClientClosed: clearActiveController,
-            onPromptActive: async () => {
-              turnController.markPromptActive();
-              await applyPendingCancel();
-            },
-          });
-        } finally {
-          checkpointPerfMetricsCapture();
-        }
+  // Shared-promise shutdown: both the signal handler (withInterrupt's
+  // onInterrupt callback) and the finally block below call doShutdown().
+  // Using a shared promise means the second caller awaits the SAME cleanup
+  // instead of returning immediately, so runSessionQueueOwner never returns
+  // before releaseQueueOwnerLease has executed.
+  let shutdownPromise: Promise<void> | null = null;
+  const doShutdown = (): Promise<void> => {
+    if (!shutdownPromise) {
+      shutdownPromise = closeQueueOwnerRuntime({
+        lease,
+        owner,
+        heartbeatTimer,
+        turnController,
+        sharedClient,
+        sessionId: options.sessionId,
+        verbose: options.verbose,
       });
     }
+    return shutdownPromise;
+  };
+
+  try {
+    // withInterrupt installs SIGTERM/SIGINT/SIGHUP handlers and calls
+    // doShutdown when any of them fires, before rejecting with
+    // InterruptedError.  Without this, a SIGTERM from lease-store's
+    // terminateProcess() would kill the Node process immediately,
+    // bypassing the finally block and leaving the bridge adapter orphaned.
+    await withInterrupt(async () => {
+      owner = await SessionQueueOwner.start(
+        lease,
+        {
+          cancelPrompt: async () => {
+            const accepted = await turnController.requestCancel();
+            if (!accepted) {
+              return false;
+            }
+            await applyPendingCancel();
+            return true;
+          },
+          closeSession: async (timeoutMs?: number) => await closeActiveBackendSession(timeoutMs),
+          setSessionMode: async (modeId: string, timeoutMs?: number) => {
+            await turnController.setSessionMode(modeId, timeoutMs);
+          },
+          setSessionModel: async (modelId: string, timeoutMs?: number) =>
+            await turnController.setSessionModel(modelId, timeoutMs),
+          setSessionConfigOption: async (configId: string, value: string, timeoutMs?: number) => {
+            return await turnController.setSessionConfigOption(configId, value, timeoutMs);
+          },
+        },
+        {
+          maxQueueDepth,
+          onQueueDepthChanged: (queueDepth) => {
+            setPerfGauge("queue.owner.depth", queueDepth);
+            void refreshQueueOwnerLease(lease, { queueDepth }).catch(() => {
+              // best effort heartbeat refresh while owner is live
+            });
+          },
+        },
+      );
+
+      logQueueOwnerReady({
+        sessionId: options.sessionId,
+        ttlMs,
+        maxQueueDepth,
+        verbose: options.verbose,
+      });
+      await refreshQueueOwnerLease(lease, { queueDepth: owner.queueDepth() }).catch(() => {
+        // best effort initial heartbeat
+      });
+      heartbeatTimer = setInterval(() => {
+        void refreshQueueOwnerLease(lease, { queueDepth: owner?.queueDepth() ?? 0 }).catch(() => {
+          // best effort heartbeat
+        });
+      }, QUEUE_OWNER_HEARTBEAT_INTERVAL_MS);
+
+      let isFirstTask = true;
+      while (true) {
+        const pollTimeoutMs = isFirstTask ? initialTaskPollTimeoutMs : taskPollTimeoutMs;
+        const task = await owner.nextTask(pollTimeoutMs);
+        if (!task) {
+          break;
+        }
+        isFirstTask = false;
+
+        await runPromptTurn(async () => {
+          try {
+            await runQueuedTask(options.sessionId, task, {
+              sharedClient,
+              verbose: options.verbose,
+              mcpServers: options.mcpServers,
+              nonInteractivePermissions: options.nonInteractivePermissions,
+              authCredentials: options.authCredentials,
+              authPolicy: options.authPolicy,
+              suppressSdkConsoleErrors: options.suppressSdkConsoleErrors,
+              promptRetries: task.promptRetries ?? 0,
+              sessionOptions: options.sessionOptions,
+              onClientAvailable: setActiveController,
+              onClientClosed: clearActiveController,
+              onPromptActive: async () => {
+                turnController.markPromptActive();
+                await applyPendingCancel();
+              },
+            });
+          } finally {
+            checkpointPerfMetricsCapture();
+          }
+        });
+      }
+    }, doShutdown);
+  } catch (error) {
+    if (!(error instanceof InterruptedError)) {
+      throw error;
+    }
+    // SIGTERM/SIGINT/SIGHUP received — graceful shutdown already completed
+    // by doShutdown() inside withInterrupt's onInterrupt callback.
   } finally {
-    await closeQueueOwnerRuntime({
-      lease,
-      owner,
-      heartbeatTimer,
-      turnController,
-      sharedClient,
-      sessionId: options.sessionId,
-      verbose: options.verbose,
-    });
+    // Idempotent: if doShutdown() already ran via the signal path, this is
+    // a no-op.  If the main loop exited normally or with an error, this
+    // ensures cleanup still happens.
+    await doShutdown();
   }
 }
 
