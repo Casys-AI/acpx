@@ -12,6 +12,8 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+- ACP/process lifecycle: retain the native macOS/Linux bridge-tree lifeline for abrupt queue-owner death while loading it only from the installed package, validating its host manifest and digest, and failing closed unless its pipe handshake is armed. Cooperative shutdown still reaps the process group before releasing the lifeline.
+
 ## 2026.8.18 (v0.13.1)
 
 ### Changes

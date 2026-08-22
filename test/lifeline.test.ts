@@ -1,337 +1,493 @@
 import assert from "node:assert/strict";
-import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { once } from "node:events";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
-import { ensureLifelineHelper, resolveLifelineHelper } from "../src/acp/lifeline.js";
+import { fileURLToPath } from "node:url";
+import { AcpClient } from "../src/acp/client.js";
+import {
+  reapSpawnedProcessGroup,
+  resolvePackagedLifelineHelper,
+  startLifelineWatchdog,
+  supportsProcessTreeLifeline,
+  validatePackagedLifelineHelper,
+} from "../src/acp/lifeline.js";
 import { isProcessAlive } from "../src/process-liveness.js";
-import { getAcpxVersion } from "../src/version.js";
-import { LIFELINE_HELPER_ENV, resolveTestLifelineHelper } from "./lifeline-test-helper.js";
 import { fileExists, withTempDir } from "./runtime-test-helpers.js";
 
-test("resolveLifelineHelper ignores helper binaries from the current working directory", async () => {
-  const previousCwd = process.cwd();
-  await withTempDir("acpx-lifeline-cwd-", async (tempDir) => {
-    const fakeHelper = path.join(tempDir, "dist", "native", "lifeline-darwin-testarch");
-    await fs.mkdir(path.dirname(fakeHelper), { recursive: true });
-    await fs.writeFile(fakeHelper, "", "utf8");
-    // Make it executable so the assertion proves the CWD is ignored, not merely
-    // that the file fails the X_OK resolution check.
-    await fs.chmod(fakeHelper, 0o755);
+const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
 
+test("process-tree lifeline support is explicit by platform", () => {
+  assert.equal(supportsProcessTreeLifeline("darwin"), true);
+  assert.equal(supportsProcessTreeLifeline("linux"), true);
+  assert.equal(supportsProcessTreeLifeline("win32"), false);
+  assert.equal(supportsProcessTreeLifeline("freebsd"), false);
+});
+
+test("lifeline resolves only the real package-relative helper", async (t) => {
+  if (!supportsProcessTreeLifeline()) {
+    t.skip("packaged native lifeline is unavailable on this platform");
+    return;
+  }
+
+  const expected = path.join(process.cwd(), "dist", "native", "lifeline");
+  const originalCwd = process.cwd();
+  const previousHome = process.env.HOME;
+  const previousOverride = process.env.ACPX_LIFELINE_HELPER;
+
+  await withTempDir("acpx-lifeline-resolution-", async (tempDir) => {
+    const fakeHelper = path.join(tempDir, "fake-helper");
+    await fs.writeFile(fakeHelper, "#!/bin/sh\nexit 99\n", { mode: 0o755 });
+    process.env.HOME = tempDir;
+    process.env.ACPX_LIFELINE_HELPER = fakeHelper;
     process.chdir(tempDir);
     try {
-      assert.equal(resolveLifelineHelper("darwin", "testarch"), undefined);
+      assert.equal(resolvePackagedLifelineHelper(), expected);
+      const stat = await fs.lstat(expected);
+      assert.equal(stat.isFile(), true);
+      assert.equal(stat.isSymbolicLink(), false);
+      assert.equal(stat.nlink, 1);
+      assert.equal(stat.mode & 0o022, 0);
     } finally {
-      process.chdir(previousCwd);
+      process.chdir(originalCwd);
+      restoreEnvironment("HOME", previousHome);
+      restoreEnvironment("ACPX_LIFELINE_HELPER", previousOverride);
     }
   });
 });
 
-test("resolveLifelineHelper accepts an existing absolute env override", async () => {
-  const previous = process.env[LIFELINE_HELPER_ENV];
-  await withTempDir("acpx-lifeline-env-", async (tempDir) => {
-    const helper = path.join(tempDir, "lifeline-helper");
-    await fs.writeFile(helper, "", "utf8");
-    await fs.chmod(helper, 0o755);
-    process.env[LIFELINE_HELPER_ENV] = helper;
+test("packaged helper validation accepts verified hardlinks and rejects substitutions", async () => {
+  await withTempDir("acpx-lifeline-validation-", async (packageRoot) => {
+    const nativeDir = path.join(packageRoot, "dist", "native");
+    const packageJson = path.join(packageRoot, "package.json");
+    const target = path.join(nativeDir, "target");
+    const candidate = path.join(nativeDir, "lifeline-test");
+    const manifest = path.join(nativeDir, "lifeline.json");
+    await fs.mkdir(nativeDir, { recursive: true });
+    await fs.writeFile(packageJson, '{"name":"acpx"}\n', "utf8");
+    await fs.writeFile(candidate, "native helper", { mode: 0o755 });
+    await writeHelperManifest(manifest, "native helper");
+    assert.equal(validatePackagedLifelineHelper(candidate, nativeDir, packageRoot), true);
+
+    await fs.chmod(candidate, 0o775);
+    assert.equal(validatePackagedLifelineHelper(candidate, nativeDir, packageRoot), false);
+    await fs.rm(candidate);
+
+    await fs.writeFile(target, "native helper", { mode: 0o755 });
+    await fs.symlink(target, candidate);
+    assert.equal(validatePackagedLifelineHelper(candidate, nativeDir, packageRoot), false);
+    await fs.rm(candidate);
+
+    await fs.link(target, candidate);
+    assert.equal(validatePackagedLifelineHelper(candidate, nativeDir, packageRoot), true);
+    await fs.rm(candidate);
+
+    const manifestContents = await fs.readFile(manifest, "utf8");
+    const manifestTarget = path.join(nativeDir, "manifest-target.json");
+    await fs.rename(manifest, manifestTarget);
+    await fs.link(manifestTarget, manifest);
+    assert.equal(validatePackagedLifelineHelper(target, nativeDir, packageRoot), true);
+    await fs.rm(manifest);
+    await fs.symlink(manifestTarget, manifest);
+    assert.equal(validatePackagedLifelineHelper(target, nativeDir, packageRoot), false);
+    await fs.rm(manifest);
+    await fs.writeFile(manifest, manifestContents, "utf8");
+
+    await fs.writeFile(candidate, "tampered helper", { mode: 0o755 });
+    assert.equal(validatePackagedLifelineHelper(candidate, nativeDir, packageRoot), false);
+  });
+});
+
+test("packaged helper validation rejects a mismatched host manifest", async () => {
+  await withTempDir("acpx-lifeline-host-validation-", async (packageRoot) => {
+    const nativeDir = path.join(packageRoot, "dist", "native");
+    const candidate = path.join(nativeDir, "lifeline");
+    const manifest = path.join(nativeDir, "lifeline.json");
+    await fs.mkdir(nativeDir, { recursive: true });
+    await fs.writeFile(path.join(packageRoot, "package.json"), '{"name":"acpx"}\n', "utf8");
+    await fs.writeFile(candidate, "native helper", { mode: 0o755 });
+    await writeHelperManifest(manifest, "native helper", "freebsd");
+
+    assert.equal(validatePackagedLifelineHelper(candidate, nativeDir, packageRoot), false);
+  });
+});
+
+test("native lifeline reaps bridge group on owner-pipe EOF", async (t) => {
+  if (!supportsProcessTreeLifeline()) {
+    t.skip("native lifeline is unavailable on this platform");
+    return;
+  }
+  const helper = resolvePackagedLifelineHelper();
+  assert(helper, "packaged helper must exist before POSIX tests run");
+
+  await withTempDir("acpx-lifeline-native-eof-", async (tempDir) => {
+    const tree = await spawnProcessTree(tempDir);
+    let watchdog: ChildProcess | undefined;
+    try {
+      watchdog = await startLifelineWatchdog(helper, tree.bridgePid);
+      assert.equal(isProcessAlive(watchdog.pid), true);
+      watchdog.stdin?.destroy();
+      await waitUntil(() =>
+        Promise.resolve(!isProcessAlive(tree.bridgePid) && !isProcessAlive(tree.grandchildPid)),
+      );
+      await waitForExit(watchdog);
+      assert.equal(isProcessAlive(tree.bridgePid), false);
+      assert.equal(isProcessAlive(tree.grandchildPid), false);
+    } finally {
+      watchdog?.stdin?.destroy();
+      killProcessGroup(tree.bridgePid);
+      killProcess(tree.grandchildPid);
+    }
+  });
+});
+
+test("native lifeline reaps when the owner disappears during ARMED acknowledgement", async (t) => {
+  if (!supportsProcessTreeLifeline()) {
+    t.skip("native lifeline is unavailable on this platform");
+    return;
+  }
+  const helper = resolvePackagedLifelineHelper();
+  assert(helper, "packaged helper must exist before POSIX tests run");
+
+  await withTempDir("acpx-lifeline-ack-owner-death-", async (tempDir) => {
+    const tree = await spawnProcessTree(tempDir);
+    const watchdog = spawn(helper, [String(tree.bridgePid)], {
+      detached: true,
+      env: {},
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    try {
+      watchdog.stdout?.destroy();
+      watchdog.stdin?.destroy();
+      await waitUntil(() =>
+        Promise.resolve(!isProcessAlive(tree.bridgePid) && !isProcessAlive(tree.grandchildPid)),
+      );
+      await waitForExit(watchdog);
+      assert.equal(isProcessAlive(tree.bridgePid), false);
+      assert.equal(isProcessAlive(tree.grandchildPid), false);
+    } finally {
+      watchdog.stdin?.destroy();
+      killProcess(watchdog.pid);
+      killProcessGroup(tree.bridgePid);
+      killProcess(tree.grandchildPid);
+    }
+  });
+});
+
+test("native lifeline reaps descendants when the bridge leader crashes", async (t) => {
+  if (!supportsProcessTreeLifeline()) {
+    t.skip("native lifeline is unavailable on this platform");
+    return;
+  }
+  const helper = resolvePackagedLifelineHelper();
+  assert(helper, "packaged helper must exist before POSIX tests run");
+
+  await withTempDir("acpx-lifeline-bridge-crash-", async (tempDir) => {
+    const tree = await spawnProcessTree(tempDir);
+    let watchdog: ChildProcess | undefined;
+    try {
+      watchdog = await startLifelineWatchdog(helper, tree.bridgePid);
+      process.kill(tree.bridgePid, "SIGKILL");
+      await waitUntil(() =>
+        Promise.resolve(!isProcessAlive(tree.bridgePid) && !isProcessAlive(tree.grandchildPid)),
+      );
+      await waitForExit(watchdog);
+      assert.equal(isProcessAlive(tree.grandchildPid), false);
+    } finally {
+      watchdog?.stdin?.destroy();
+      killProcess(watchdog?.pid);
+      killProcessGroup(tree.bridgePid);
+      killProcess(tree.grandchildPid);
+    }
+  });
+});
+
+test("failed lifeline handshake is followed by independent group cleanup", async (t) => {
+  if (!supportsProcessTreeLifeline()) {
+    t.skip("native lifeline is unavailable on this platform");
+    return;
+  }
+
+  await withTempDir("acpx-lifeline-arm-failure-", async (tempDir) => {
+    const fakeHelper = path.join(tempDir, "fake-helper");
+    await fs.writeFile(fakeHelper, "#!/bin/sh\nprintf 'NOT_ARMED\\n'\nexit 2\n", {
+      mode: 0o755,
+    });
+    const tree = await spawnProcessTree(tempDir);
+    try {
+      await assert.rejects(
+        () => startLifelineWatchdog(fakeHelper, tree.bridgePid),
+        /invalid lifeline handshake|exited before arming/,
+      );
+      assert.equal(
+        await reapSpawnedProcessGroup(tree.bridge, 500, 500),
+        true,
+        "owner must independently prove the group was reaped",
+      );
+      assert.equal(isProcessAlive(tree.bridgePid), false);
+      assert.equal(isProcessAlive(tree.grandchildPid), false);
+    } finally {
+      killProcessGroup(tree.bridgePid);
+      killProcess(tree.grandchildPid);
+    }
+  });
+});
+
+test("AcpClient graceful close reaps bridge descendants and watchdog", async (t) => {
+  if (!supportsProcessTreeLifeline()) {
+    t.skip("native lifeline is unavailable on this platform");
+    return;
+  }
+
+  await withTempDir("acpx-lifeline-close-", async (tempDir) => {
+    const bridgePidFile = path.join(tempDir, "bridge.pid");
+    const grandchildPidFile = path.join(tempDir, "grandchild.pid");
+    const client = makeTreeClient(tempDir, bridgePidFile, grandchildPidFile, []);
+    let bridgePid: number | undefined;
+    let grandchildPid: number | undefined;
+    let watchdogPid: number | undefined;
 
     try {
-      assert.equal(resolveLifelineHelper("darwin", "testarch"), helper);
+      await client.start();
+      await waitUntil(() => fileExists(bridgePidFile));
+      await waitUntil(() => fileExists(grandchildPidFile));
+      bridgePid = await readPidFile(bridgePidFile);
+      grandchildPid = await readPidFile(grandchildPidFile);
+      watchdogPid = lifelinePid(client);
+      assert.equal(client.getAgentPid(), bridgePid);
+      assert(watchdogPid && watchdogPid !== bridgePid);
+
+      await client.close();
+      await waitUntil(() =>
+        Promise.resolve(
+          !isProcessAlive(bridgePid) &&
+            !isProcessAlive(grandchildPid) &&
+            !isProcessAlive(watchdogPid),
+        ),
+      );
     } finally {
-      if (previous === undefined) {
-        delete process.env[LIFELINE_HELPER_ENV];
-      } else {
-        process.env[LIFELINE_HELPER_ENV] = previous;
-      }
+      await client.close().catch(() => {});
+      killProcessGroup(bridgePid);
+      killProcess(grandchildPid);
+      killProcess(watchdogPid);
     }
   });
 });
 
-test("resolveLifelineHelper rejects an existing non-executable absolute env override", async () => {
-  await withTempDir("acpx-lifeline-env-nonexec-", async (tempDir) => {
-    const helper = path.join(tempDir, "lifeline-helper");
-    await fs.writeFile(helper, "", { encoding: "utf8", mode: 0o644 });
-    await fs.chmod(helper, 0o644);
+test("AcpClient initialization failure reaps bridge descendants", async (t) => {
+  if (!supportsProcessTreeLifeline()) {
+    t.skip("native lifeline is unavailable on this platform");
+    return;
+  }
 
-    await withEnv({ [LIFELINE_HELPER_ENV]: helper }, async () => {
-      assert.equal(resolveLifelineHelper("darwin", "testarch"), undefined);
-    });
+  await withTempDir("acpx-lifeline-init-failure-", async (tempDir) => {
+    const bridgePidFile = path.join(tempDir, "bridge.pid");
+    const grandchildPidFile = path.join(tempDir, "grandchild.pid");
+    const client = makeTreeClient(tempDir, bridgePidFile, grandchildPidFile, [
+      "--fail-initialize",
+      "--ignore-sigterm",
+    ]);
+    let bridgePid: number | undefined;
+    let grandchildPid: number | undefined;
+
+    try {
+      await assert.rejects(() => client.start(), /initialize failed/i);
+      await waitUntil(() => fileExists(bridgePidFile));
+      await waitUntil(() => fileExists(grandchildPidFile));
+      bridgePid = await readPidFile(bridgePidFile);
+      grandchildPid = await readPidFile(grandchildPidFile);
+      await waitUntil(() =>
+        Promise.resolve(!isProcessAlive(bridgePid) && !isProcessAlive(grandchildPid)),
+      );
+    } finally {
+      await client.close().catch(() => {});
+      killProcessGroup(bridgePid);
+      killProcess(grandchildPid);
+    }
   });
 });
 
-test("ensureLifelineHelper compiles the packaged lifeline source into the user cache", async (t) => {
-  if (process.platform === "win32") {
-    t.skip("lifeline helper is POSIX-only");
-    return;
-  }
-  if (!(await commandExists(process.env.CC ?? "cc"))) {
-    t.skip("cc is unavailable");
+test("repeated ACP sessions leave no bridge, descendant, or lifeline buildup", async (t) => {
+  if (!supportsProcessTreeLifeline()) {
+    t.skip("native lifeline is unavailable on this platform");
     return;
   }
 
-  await withTempDir("acpx-lifeline-cache-", async (homeDir) => {
-    const arch = `cache-test-${process.pid}`;
-    await withEnv(
-      {
-        HOME: homeDir,
-        [LIFELINE_HELPER_ENV]: undefined,
-      },
-      async () => {
-        const helper = await ensureLifelineHelper({ arch });
-        assert(helper, "helper must compile into cache");
-        assert.equal(path.dirname(helper), path.join(homeDir, ".acpx", "native"));
-        assert.match(
-          path.basename(helper),
-          new RegExp(`^lifeline-${escapeRegExp(getAcpxVersion())}-`),
-        );
+  await withTempDir("acpx-lifeline-repeated-sessions-", async (tempDir) => {
+    const observedPids: number[] = [];
 
-        const firstStat = await fs.stat(helper);
-        const second = await ensureLifelineHelper({ arch });
-        const secondStat = await fs.stat(helper);
+    for (let iteration = 0; iteration < 5; iteration += 1) {
+      const bridgePidFile = path.join(tempDir, `bridge-${iteration}.pid`);
+      const grandchildPidFile = path.join(tempDir, `grandchild-${iteration}.pid`);
+      const client = makeTreeClient(tempDir, bridgePidFile, grandchildPidFile, []);
+      let watchdogPid: number | undefined;
 
-        assert.equal(second, helper);
-        assert.equal(secondStat.mtimeMs, firstStat.mtimeMs, "cache hit must not recompile");
-      },
+      try {
+        await client.start();
+        await client.createSession();
+        await waitUntil(() => fileExists(bridgePidFile));
+        await waitUntil(() => fileExists(grandchildPidFile));
+        const bridgePid = await readPidFile(bridgePidFile);
+        const grandchildPid = await readPidFile(grandchildPidFile);
+        watchdogPid = lifelinePid(client);
+        assert.equal(client.getAgentPid(), bridgePid, "lifecycle PID must remain the bridge");
+        assert(watchdogPid, "lifeline must be armed for every session");
+        observedPids.push(bridgePid, grandchildPid, watchdogPid);
+
+        await client.close();
+        await waitUntil(() => Promise.resolve(observedPids.every((pid) => !isProcessAlive(pid))));
+      } finally {
+        await client.close().catch(() => {});
+        killProcess(watchdogPid);
+      }
+    }
+
+    assert.equal(
+      observedPids.some((pid) => isProcessAlive(pid)),
+      false,
     );
   });
 });
 
-test("ensureLifelineHelper records lazy compile failures and does not retry in process", async (t) => {
-  if (process.platform === "win32") {
-    t.skip("lifeline helper is POSIX-only");
-    return;
-  }
+type SpawnedTree = {
+  bridge: ChildProcess;
+  bridgePid: number;
+  grandchildPid: number;
+};
 
-  await withTempDir("acpx-lifeline-cache-fail-", async (homeDir) => {
-    const arch = `cache-fail-test-${process.pid}`;
-    const messages: string[] = [];
-    await withEnv(
-      {
-        CC: path.join(homeDir, "missing-cc"),
-        HOME: homeDir,
-        [LIFELINE_HELPER_ENV]: undefined,
-      },
-      async () => {
-        assert.equal(
-          await ensureLifelineHelper({ arch, log: (message: string) => messages.push(message) }),
-          undefined,
-        );
-        assert.equal(
-          await ensureLifelineHelper({ arch, log: (message: string) => messages.push(message) }),
-          undefined,
-        );
-
-        const nativeDir = path.join(homeDir, ".acpx", "native");
-        const markers = (await fs.readdir(nativeDir)).filter((entry) => entry.endsWith(".failed"));
-        assert.equal(markers.length, 1);
-        assert.equal(messages.length, 1, "compile failure should log once per process");
-      },
-    );
-  });
-});
-
-test("native lifeline disarms when the bridge process group disappears before owner EOF", async (t) => {
-  if (process.platform === "win32") {
-    t.skip("lifeline helper is POSIX-only");
-    return;
-  }
-
-  const helper = await resolveTestLifelineHelper();
-  if (!helper) {
-    t.skip("lifeline helper binary is unavailable");
-    return;
-  }
-
-  const bridge = spawn(process.execPath, ["--eval", "setTimeout(() => process.exit(0), 50);"], {
+async function spawnProcessTree(tempDir: string): Promise<SpawnedTree> {
+  const bridgePidFile = path.join(tempDir, `native-bridge-${process.pid}.pid`);
+  const grandchildPidFile = path.join(tempDir, `native-grandchild-${process.pid}.pid`);
+  const grandchildScript = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
+  const bridgeScript = `
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const grandchild = spawn(process.execPath, ["--eval", ${JSON.stringify(grandchildScript)}], { stdio: "ignore" });
+grandchild.unref();
+fs.writeFileSync(${JSON.stringify(grandchildPidFile)}, String(grandchild.pid));
+fs.writeFileSync(${JSON.stringify(bridgePidFile)}, String(process.pid));
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+`;
+  const bridge = spawn(process.execPath, ["--eval", bridgeScript], {
     detached: true,
     stdio: "ignore",
   });
-  assert(bridge.pid, "bridge must receive a PID");
-  const bridgeExit = once(bridge, "exit");
+  assert(bridge.pid);
   bridge.unref();
-
-  let watchdog: ChildProcess | undefined;
-
-  try {
-    watchdog = spawn(helper, [String(bridge.pid)], {
-      stdio: ["pipe", "ignore", "ignore"],
-    });
-    await once(watchdog, "spawn");
-    await bridgeExit;
-
-    await waitForChildExit(watchdog, 2_000);
-    assert.equal(watchdog.exitCode, 0, "lifeline should exit cleanly after disarming");
-  } finally {
-    killProcessIfAlive(watchdog?.pid);
-    killProcessGroupIfAlive(bridge.pid);
-  }
-});
-
-test("native lifeline SIGKILLs TERM-resistant descendants after the bridge exits", async (t) => {
-  if (process.platform === "win32") {
-    t.skip("lifeline helper is POSIX-only");
-    return;
-  }
-
-  const helper = await resolveTestLifelineHelper();
-  if (!helper) {
-    t.skip("lifeline helper binary is unavailable");
-    return;
-  }
-
-  await withTempDir("acpx-lifeline-term-resistant-descendant-", async (tempDir) => {
-    const bridgePidFile = path.join(tempDir, "bridge.pid");
-    const grandchildPidFile = path.join(tempDir, "grandchild.pid");
-    const grandchildScript = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
-    const bridgeScript = `
-const { spawn } = require("node:child_process");
-const fs = require("node:fs");
-const grandchild = spawn(process.execPath, ["--eval", ${JSON.stringify(grandchildScript)}], {
-  stdio: "ignore",
-});
-if (!grandchild.pid) {
-  process.exit(2);
+  await waitUntil(() => fileExists(bridgePidFile));
+  await waitUntil(() => fileExists(grandchildPidFile));
+  return {
+    bridge,
+    bridgePid: await readPidFile(bridgePidFile),
+    grandchildPid: await readPidFile(grandchildPidFile),
+  };
 }
-grandchild.unref();
-fs.writeFileSync(${JSON.stringify(grandchildPidFile)}, String(grandchild.pid) + "\\n", "utf8");
-fs.writeFileSync(${JSON.stringify(bridgePidFile)}, String(process.pid) + "\\n", "utf8");
-setTimeout(() => process.exit(0), 50);
-`;
 
-    const bridge = spawn(process.execPath, ["--eval", bridgeScript], {
-      detached: true,
-      stdio: "ignore",
-    });
-    assert(bridge.pid, "bridge must receive a PID");
-    const bridgeExit = once(bridge, "exit");
-    bridge.unref();
+function makeTreeClient(
+  cwd: string,
+  bridgePidFile: string,
+  grandchildPidFile: string,
+  extraArgs: string[],
+): AcpClient {
+  return new AcpClient({
+    agentCommand: [
+      "node",
+      JSON.stringify(MOCK_AGENT_PATH),
+      "--pid-file",
+      JSON.stringify(bridgePidFile),
+      "--grandchild-pid-file",
+      JSON.stringify(grandchildPidFile),
+      "--grandchild-ignore-sigterm",
+      "--stay-alive-after-stdin-end",
+      ...extraArgs,
+    ].join(" "),
+    cwd,
+    permissionMode: "approve-reads",
+  });
+}
 
-    let grandchildPid: number | undefined;
-    let watchdog: ChildProcess | undefined;
-
-    try {
-      assert.equal(await waitUntil(() => fileExists(bridgePidFile)), true);
-      assert.equal(await waitUntil(() => fileExists(grandchildPidFile)), true);
-      grandchildPid = Number((await fs.readFile(grandchildPidFile, "utf8")).trim());
-      assert(Number.isInteger(grandchildPid) && grandchildPid > 0, "grandchild PID must be valid");
-      assert.equal(isProcessAlive(grandchildPid), true, "grandchild must start alive");
-
-      watchdog = spawn(helper, [String(bridge.pid)], {
-        stdio: ["pipe", "ignore", "ignore"],
-      });
-      await once(watchdog, "spawn");
-      await bridgeExit;
-      watchdog.stdin?.end();
-      await once(watchdog, "exit");
-
-      assert.equal(
-        await waitUntil(() => Promise.resolve(!isProcessAlive(grandchildPid))),
-        true,
-        "TERM-resistant grandchild must be killed by lifeline SIGKILL fallback",
-      );
-    } finally {
-      killProcessIfAlive(watchdog?.pid);
-      killProcessGroupIfAlive(bridge.pid);
-      killProcessIfAlive(grandchildPid);
+function lifelinePid(client: AcpClient): number | undefined {
+  return (
+    client as unknown as {
+      lifelineWatchdog?: ChildProcess;
     }
-  });
-});
-
-async function commandExists(command: string): Promise<boolean> {
-  return await new Promise((resolve) => {
-    const child = execFile(command, ["--version"], (error: Error | null) => {
-      resolve(!error);
-    });
-    child.on("error", () => resolve(false));
-  });
+  ).lifelineWatchdog?.pid;
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+async function readPidFile(filePath: string): Promise<number> {
+  const pid = Number((await fs.readFile(filePath, "utf8")).trim());
+  assert(Number.isInteger(pid) && pid > 1);
+  return pid;
+}
+
+async function waitForExit(child: ChildProcess, timeoutMs = 3_000): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  await Promise.race([
+    new Promise<void>((resolve) => child.once("exit", () => resolve())),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("child did not exit in time")), timeoutMs),
+    ),
+  ]);
 }
 
 async function waitUntil(
   condition: () => Promise<boolean>,
-  timeoutMs = 2_000,
-  pollMs = 50,
-): Promise<boolean> {
+  timeoutMs = 3_000,
+  pollMs = 25,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await condition()) {
-      return true;
+      return;
     }
     await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
   }
-  return false;
+  throw new Error(`condition not met within ${timeoutMs}ms`);
 }
 
-async function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return;
-  }
-
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      once(child, "exit"),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("child did not exit in time")), timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-}
-
-function killProcessIfAlive(pid: number | undefined): void {
-  if (pid === undefined || !isProcessAlive(pid)) {
-    return;
-  }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // best effort cleanup
-  }
-}
-
-function killProcessGroupIfAlive(pgid: number | undefined): void {
-  if (pgid === undefined) {
+function killProcessGroup(pgid: number | undefined): void {
+  if (!pgid) {
     return;
   }
   try {
     process.kill(-pgid, "SIGKILL");
   } catch {
-    // best effort cleanup
+    // best effort test cleanup
   }
 }
 
-async function withEnv<T>(
-  entries: Record<string, string | undefined>,
-  run: () => Promise<T>,
-): Promise<T> {
-  const previous = new Map<string, string | undefined>();
-  for (const [key, value] of Object.entries(entries)) {
-    previous.set(key, process.env[key]);
-    if (value === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = value;
-    }
+function killProcess(pid: number | undefined): void {
+  if (!pid || !isProcessAlive(pid)) {
+    return;
   }
-
   try {
-    return await run();
-  } finally {
-    for (const [key, value] of previous) {
-      if (value === undefined) {
-        delete process.env[key];
-      } else {
-        process.env[key] = value;
-      }
-    }
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // best effort test cleanup
   }
+}
+
+function restoreEnvironment(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}
+
+async function writeHelperManifest(
+  manifestPath: string,
+  helperContents: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  const sha256 = createHash("sha256").update(helperContents).digest("hex");
+  await fs.writeFile(
+    manifestPath,
+    `${JSON.stringify({ platform, arch: process.arch, sha256 })}\n`,
+    "utf8",
+  );
 }

@@ -1,89 +1,133 @@
-import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { spawn, type ChildProcess, type ChildProcessByStdio } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
-import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
-import { getAcpxVersion } from "../version.js";
+import { isChildProcessRunning, waitForChildExit, waitForSpawn } from "./client-process.js";
 
-const execFileAsync = promisify(execFile);
-const LIFELINE_HELPER_ENV = "ACPX_LIFELINE_HELPER";
-const failedCompileCachePaths = new Set<string>();
-const reportedCompileFailures = new Set<string>();
-let cachedPackageRoot: string | undefined;
+const ARMED_MESSAGE = "ARMED\n";
+const ARMED_TIMEOUT_MS = 1_000;
+const MAX_HANDSHAKE_OUTPUT = 128;
+const UNARMED_STOP_GRACE_MS = 500;
 
-type EnsureLifelineHelperOptions = {
-  arch?: string;
-  log?: (message: string) => void;
-  platform?: NodeJS.Platform;
-};
+export type LifelineWatchdog = ChildProcessByStdio<Writable, Readable, Readable>;
 
-type LifelineTarget = {
-  arch: string;
-  cachePath: string;
-  platform: NodeJS.Platform;
-};
-
-type FastPathResult =
-  | {
-      helper?: string;
-      status: "done";
-    }
-  | {
-      status: "compile";
-    };
-
-function unique(values: string[]): string[] {
-  return [...new Set(values)];
-}
-
-function isExecutableFile(candidate: string): boolean {
-  try {
-    if (!fs.statSync(candidate).isFile()) {
-      return false;
-    }
-    fs.accessSync(candidate, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function resolveEnvOverride(override: string): string | undefined {
-  if (!path.isAbsolute(override)) {
-    return undefined;
-  }
-  return isExecutableFile(override) ? override : undefined;
-}
-
-function configuredEnvOverride(): string | undefined {
-  return process.env[LIFELINE_HELPER_ENV]?.trim() || undefined;
-}
-
-function isSupportedPlatform(platform: NodeJS.Platform): boolean {
+export function supportsProcessTreeLifeline(platform: NodeJS.Platform = process.platform): boolean {
   return platform === "darwin" || platform === "linux";
 }
 
-function lifelineHelperName(platform: NodeJS.Platform, arch: string): string {
-  return `lifeline-${platform}-${arch}`;
+export function resolvePackagedLifelineHelper(
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string | undefined {
+  if (!supportsProcessTreeLifeline(platform)) {
+    return undefined;
+  }
+
+  const packageRoot = findPackageRoot();
+  if (!packageRoot) {
+    return undefined;
+  }
+  const nativeDir = path.join(packageRoot, "dist", "native");
+  const candidate = path.join(nativeDir, "lifeline");
+  return validatePackagedLifelineHelper(candidate, nativeDir, packageRoot, platform, arch)
+    ? candidate
+    : undefined;
 }
 
-function moduleDir(): string {
-  return path.dirname(fileURLToPath(import.meta.url));
+export async function startLifelineWatchdog(
+  helper: string,
+  bridgePgid: number,
+  handshakeTimeoutMs = ARMED_TIMEOUT_MS,
+): Promise<LifelineWatchdog> {
+  const watchdog = spawn(helper, [String(bridgePgid)], {
+    cwd: path.dirname(helper),
+    detached: true,
+    env: {},
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+  }) as LifelineWatchdog;
+
+  try {
+    await waitForSpawn(watchdog);
+    await waitForArmed(watchdog, handshakeTimeoutMs);
+    watchdog.stdout.destroy();
+    watchdog.stderr.destroy();
+    watchdog.unref();
+    return watchdog;
+  } catch (error) {
+    await stopUnarmedWatchdog(watchdog);
+    throw error;
+  }
+}
+
+export function releaseLifelineWatchdog(watchdog: LifelineWatchdog | undefined): void {
+  if (!watchdog?.stdin || watchdog.stdin.destroyed) {
+    return;
+  }
+  try {
+    watchdog.stdin.once("error", () => {});
+    watchdog.stdin.end("R");
+  } catch {
+    // best effort after the bridge group is already proved empty
+  }
+}
+
+export async function reapSpawnedProcessGroup(
+  child: ChildProcess,
+  termGraceMs: number,
+  killGraceMs: number,
+): Promise<boolean> {
+  if (child.pid === undefined) {
+    child.kill("SIGTERM");
+    return !isChildProcessRunning(child);
+  }
+
+  signalProcessGroup(child.pid, "SIGTERM");
+  let reaped = await waitForChildAndProcessGroupExit(child, child.pid, termGraceMs);
+  if (!reaped) {
+    signalProcessGroup(child.pid, "SIGKILL");
+    reaped = await waitForChildAndProcessGroupExit(child, child.pid, killGraceMs);
+  }
+  child.stdin?.destroy();
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+  return reaped;
+}
+
+export async function waitForChildAndProcessGroupExit(
+  child: ChildProcess,
+  processGroupId: number,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (true) {
+    if (!isChildProcessRunning(child) && !hasLiveProcessGroup(processGroupId)) {
+      return true;
+    }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      return false;
+    }
+    await delay(Math.min(20, remainingMs));
+  }
+}
+
+export function hasLiveProcessGroup(processGroupId: number): boolean {
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) === "EPERM";
+  }
 }
 
 function findPackageRoot(): string | undefined {
-  if (cachedPackageRoot !== undefined) {
-    return cachedPackageRoot;
-  }
-
-  let current = moduleDir();
+  let current = path.dirname(fileURLToPath(import.meta.url));
   while (true) {
     if (isAcpxPackageRoot(current)) {
-      cachedPackageRoot = current;
-      return cachedPackageRoot;
+      return current;
     }
     const parent = path.dirname(current);
     if (parent === current) {
@@ -104,152 +148,159 @@ function isAcpxPackageRoot(candidate: string): boolean {
   }
 }
 
-function prebuiltCandidates(fileName: string): string[] {
-  const base = moduleDir();
-  const packageRoot = findPackageRoot();
-  return unique([
-    path.join(base, "native", fileName),
-    ...(packageRoot ? [path.join(packageRoot, "dist", "native", fileName)] : []),
-  ]);
-}
-
-function sourceCandidates(fileName: string): string[] {
-  const packageRoot = findPackageRoot();
-  return packageRoot ? [path.join(packageRoot, "native", fileName)] : [];
-}
-
-function findExecutable(candidates: string[]): string | undefined {
-  return candidates.find(isExecutableFile);
-}
-
-function findExistingFile(candidates: string[]): string | undefined {
-  return candidates.find((candidate) => fs.existsSync(candidate));
-}
-
-function cachePathFor(platform: NodeJS.Platform, arch: string): string {
-  return path.join(
-    os.homedir(),
-    ".acpx",
-    "native",
-    `lifeline-${getAcpxVersion()}-${platform}-${arch}`,
-  );
-}
-
-function resolveCachedHelper(platform: NodeJS.Platform, arch: string): string | undefined {
-  const cachePath = cachePathFor(platform, arch);
-  return isExecutableFile(cachePath) ? cachePath : undefined;
-}
-
-export function resolveLifelineHelper(
+export function validatePackagedLifelineHelper(
+  candidate: string,
+  nativeDir: string,
+  packageRoot: string,
   platform: NodeJS.Platform = process.platform,
   arch: string = process.arch,
+): boolean {
+  try {
+    const packageStat = fs.statSync(path.join(packageRoot, "package.json"));
+    if (!isTrustedPackageFile(candidate, nativeDir, packageStat.uid, true)) {
+      return false;
+    }
+    const manifestPath = path.join(nativeDir, "lifeline.json");
+    if (!isTrustedPackageFile(manifestPath, nativeDir, packageStat.uid, false)) {
+      return false;
+    }
+    const expectedSha256 = readManifestSha256(manifestPath, platform, arch);
+    if (!expectedSha256) {
+      return false;
+    }
+    const actualSha256 = createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
+    return actualSha256 === expectedSha256;
+  } catch {
+    return false;
+  }
+}
+
+function readManifestSha256(
+  manifestPath: string,
+  platform: NodeJS.Platform,
+  arch: string,
 ): string | undefined {
-  const override = configuredEnvOverride();
-  if (override) {
-    return resolveEnvOverride(override);
-  }
-
-  if (!isSupportedPlatform(platform)) {
-    return undefined;
-  }
-
-  return (
-    findExecutable(prebuiltCandidates(lifelineHelperName(platform, arch))) ??
-    resolveCachedHelper(platform, arch)
-  );
-}
-
-export async function ensureLifelineHelper(
-  options: EnsureLifelineHelperOptions = {},
-): Promise<string | undefined> {
-  const target = lifelineTarget(options);
-  const fastPath = resolveEnsureFastPath(target);
-  if (fastPath.status === "done") {
-    return fastPath.helper;
-  }
-  if (hasRememberedCompileFailure(target.cachePath)) {
-    return undefined;
-  }
-
-  const source = findExistingFile(sourceCandidates("lifeline.c"));
-  if (!source) {
-    await rememberCompileFailure(target.cachePath, "lifeline source not found", options.log);
-    return undefined;
-  }
-
-  try {
-    await compileLifelineSource(source, target.cachePath);
-    return isExecutableFile(target.cachePath) ? target.cachePath : undefined;
-  } catch (error) {
-    await rememberCompileFailure(target.cachePath, formatCompileFailure(error), options.log);
-    return undefined;
-  }
-}
-
-function lifelineTarget(options: EnsureLifelineHelperOptions): LifelineTarget {
-  const platform = options.platform ?? process.platform;
-  const arch = options.arch ?? process.arch;
-  return {
-    arch,
-    cachePath: cachePathFor(platform, arch),
-    platform,
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
+    platform?: unknown;
+    arch?: unknown;
+    sha256?: unknown;
   };
+  if (manifest.platform !== platform || manifest.arch !== arch) {
+    return undefined;
+  }
+  if (typeof manifest.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(manifest.sha256)) {
+    return undefined;
+  }
+  return manifest.sha256;
 }
 
-function resolveEnsureFastPath(target: LifelineTarget): FastPathResult {
-  const resolved = resolveLifelineHelper(target.platform, target.arch);
-  if (resolved || configuredEnvOverride() || !isSupportedPlatform(target.platform)) {
-    return {
-      helper: resolved,
-      status: "done",
+function isTrustedPackageFile(
+  candidate: string,
+  nativeDir: string,
+  packageOwnerUid: number,
+  executable: boolean,
+): boolean {
+  const linkStat = fs.lstatSync(candidate);
+  if (
+    !linkStat.isFile() ||
+    linkStat.isSymbolicLink() ||
+    linkStat.uid !== packageOwnerUid ||
+    (linkStat.mode & 0o022) !== 0
+  ) {
+    return false;
+  }
+  const realNativeDir = fs.realpathSync(nativeDir);
+  const realCandidate = fs.realpathSync(candidate);
+  if (path.dirname(realCandidate) !== realNativeDir) {
+    return false;
+  }
+  if (executable) {
+    fs.accessSync(candidate, fs.constants.X_OK);
+  }
+  return true;
+}
+
+function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-processGroupId, signal);
+  } catch {
+    // best effort; the group may already be gone
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return undefined;
+  }
+  return typeof error.code === "string" ? error.code : undefined;
+}
+
+async function delay(ms: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function waitForArmed(watchdog: LifelineWatchdog, timeoutMs: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let output = "";
+    let settled = false;
+    const timer = setTimeout(
+      () => fail(new Error(`lifeline did not arm within ${timeoutMs}ms`)),
+      Math.max(1, timeoutMs),
+    );
+
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      watchdog.stdout.off("data", onData);
+      watchdog.off("error", onError);
+      watchdog.off("exit", onExit);
     };
-  }
-  return { status: "compile" };
-}
+    const fail = (error: Error): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      output += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      if (output.length > MAX_HANDSHAKE_OUTPUT) {
+        fail(new Error("lifeline handshake exceeded its output limit"));
+        return;
+      }
+      if (output === ARMED_MESSAGE) {
+        settled = true;
+        cleanup();
+        resolve();
+        return;
+      }
+      if (!ARMED_MESSAGE.startsWith(output)) {
+        fail(new Error(`invalid lifeline handshake: ${JSON.stringify(output)}`));
+      }
+    };
+    const onError = (error: Error): void => fail(error);
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      fail(new Error(`lifeline exited before arming (code=${code}, signal=${signal})`));
+    };
 
-function hasRememberedCompileFailure(cachePath: string): boolean {
-  return failedCompileCachePaths.has(cachePath) || fs.existsSync(`${cachePath}.failed`);
-}
-
-async function compileLifelineSource(source: string, cachePath: string): Promise<void> {
-  await fsp.mkdir(path.dirname(cachePath), { recursive: true });
-  const tmpPath = `${cachePath}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    await execFileAsync(process.env.CC ?? "cc", ["-O2", "-o", tmpPath, source]);
-    await renameCompiledHelper(tmpPath, cachePath);
-  } catch (error) {
-    await fsp.rm(tmpPath, { force: true }).catch(() => {});
-    throw error;
-  }
-}
-
-async function renameCompiledHelper(tmpPath: string, cachePath: string): Promise<void> {
-  try {
-    await fsp.rename(tmpPath, cachePath);
-  } catch (error) {
-    if (fs.existsSync(cachePath)) {
-      await fsp.rm(tmpPath, { force: true }).catch(() => {});
+    if (watchdog.exitCode !== null || watchdog.signalCode !== null) {
+      onExit(watchdog.exitCode, watchdog.signalCode);
       return;
     }
-    throw error;
-  }
+    watchdog.stdout.on("data", onData);
+    watchdog.once("error", onError);
+    watchdog.once("exit", onExit);
+  });
 }
 
-async function rememberCompileFailure(
-  cachePath: string,
-  reason: string,
-  log: ((message: string) => void) | undefined,
-): Promise<void> {
-  failedCompileCachePaths.add(cachePath);
-  await fsp.mkdir(path.dirname(cachePath), { recursive: true }).catch(() => {});
-  await fsp.writeFile(`${cachePath}.failed`, `${reason}\n`, "utf8").catch(() => {});
-  if (reportedCompileFailures.has(cachePath)) {
-    return;
+async function stopUnarmedWatchdog(watchdog: LifelineWatchdog): Promise<void> {
+  watchdog.stdin.destroy();
+  const exited = await waitForChildExit(watchdog, UNARMED_STOP_GRACE_MS);
+  if (!exited) {
+    // The trusted helper may still be reaping the bridge group. Never kill it
+    // before the owner independently proves that group empty.
+    watchdog.unref();
   }
-  reportedCompileFailures.add(cachePath);
-  log?.(`lifeline helper lazy compile failed: ${reason}`);
-}
-
-function formatCompileFailure(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  watchdog.stdout.destroy();
+  watchdog.stderr.destroy();
 }

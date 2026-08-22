@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 type PackageJson = {
-  files?: string[];
+  bin?: Record<string, string>;
   scripts?: Record<string, string>;
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
@@ -86,11 +86,14 @@ test("test scripts build packaged output before running package-bin smoke tests"
   assert.match(pkg.scripts?.["test:coverage"] ?? "", /^pnpm run build && pnpm run build:test && /);
 });
 
-test("package ships lifeline source but prepack does not ship host-native helper binaries", () => {
+test("packaged builds include the native lifeline", () => {
   const pkg = readPackageJson();
-  const prepack = pkg.scripts?.prepack ?? "";
 
-  assert(pkg.files?.includes("native"), "native source directory must be included in package");
-  assert.doesNotMatch(prepack, /\bbuild:native\b/);
-  assert.match(prepack, /dist\/native/);
+  assert.match(pkg.scripts?.build ?? "", /pnpm run build:native$/);
+  assert.match(pkg.scripts?.build ?? "", /tsdown .+ --clean/);
+  assert.match(pkg.scripts?.["build:quiet"] ?? "", /pnpm run build:native$/);
+  assert.match(pkg.scripts?.prepack ?? "", /pnpm run build:native$/);
+  assert.match(pkg.scripts?.dev ?? "", /^pnpm run build:native && tsx /);
+  assert.equal(pkg.scripts?.["build:native"], "node scripts/build-native-lifeline.mjs");
+  assert.equal(pkg.bin?.["acpx-lifeline"], "dist/native/lifeline");
 });

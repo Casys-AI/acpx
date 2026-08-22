@@ -18,11 +18,11 @@
     "url": "https://github.com/openclaw/acpx"
   },
   "bin": {
-    "acpx": "dist/cli.js"
+    "acpx": "dist/cli.js",
+    "acpx-lifeline": "dist/native/lifeline"
   },
   "files": [
     "dist",
-    "native",
     "skills",
     "README.md",
     "LICENSE"
@@ -49,7 +49,7 @@
     "crabbox:run": "crabbox run",
     "crabbox:stop": "crabbox stop",
     "crabbox:warmup": "crabbox warmup",
-    "dev": "tsx src/cli.ts",
+    "dev": "pnpm run build:native && tsx src/cli.ts",
     "docs:site": "node scripts/build-docs-site.mjs",
     "format": "oxfmt --write",
     "format:check": "oxfmt --check",
@@ -64,7 +64,7 @@
     "mutate": "stryker run",
     "perf:report": "tsx scripts/perf-report.ts",
     "precommit": "pnpm exec lint-staged && pnpm run -s build",
-    "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension && node -e \"require('node:fs').rmSync('dist/native',{recursive:true,force:true})\"",
+    "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension && pnpm run build:native",
     "prepare": "husky",
     "test": "pnpm run build && pnpm run build:test && node --test dist-test/test/*.test.js",
     "test:changed": "pnpm run test:coverage",

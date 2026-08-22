@@ -116,7 +116,16 @@ import {
 } from "./client-process.js";
 import { extractAcpError } from "./error-shapes.js";
 import { isAcpMessageObject, isSessionUpdateNotification } from "./jsonrpc.js";
-import { ensureLifelineHelper } from "./lifeline.js";
+import {
+  hasLiveProcessGroup,
+  reapSpawnedProcessGroup,
+  releaseLifelineWatchdog,
+  resolvePackagedLifelineHelper,
+  startLifelineWatchdog,
+  supportsProcessTreeLifeline,
+  waitForChildAndProcessGroupExit,
+  type LifelineWatchdog,
+} from "./lifeline.js";
 import {
   modelStateFromConfigOptions,
   modelStateFromSessionResponse,
@@ -626,7 +635,7 @@ export class AcpClient {
   private lastAgentExit?: AgentExitInfo;
   private lastKnownPid?: number;
   private agentGroupLeader = false;
-  private lifelineWatchdog?: ChildProcess;
+  private lifelineWatchdog?: LifelineWatchdog;
   private readonly promptPermissionFailures = new Map<string, PermissionPromptUnavailableError>();
   private readonly pendingConnectionRequests = new Set<PendingConnectionRequest>();
   private readonly modelConfigIds = new Map<string, string>();
@@ -818,21 +827,13 @@ export class AcpClient {
     const launch = await this.resolveAgentLaunchPlan();
     this.logAgentLaunch(launch);
     await this.ensureLaunchSupport(launch);
-    const child = await this.spawnAgentProcess(launch);
+    const startupStderr: string[] = [];
+    const child = await this.spawnAgentProcess(launch, startupStderr);
     this.closing = false;
     this.agentStartedAt = isoNow();
     this.lastAgentExit = undefined;
     this.lastKnownPid = child.pid ?? undefined;
     this.attachAgentLifecycleObservers(child);
-    const startupStderr: string[] = [];
-
-    child.stderr.on("data", (chunk: Buffer | string) => {
-      this.captureStartupStderr(startupStderr, chunk);
-      if (!this.options.verbose) {
-        return;
-      }
-      process.stderr.write(chunk);
-    });
 
     const input = Writable.toWeb(child.stdin);
     const output = Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>;
@@ -920,89 +921,75 @@ export class AcpClient {
 
   private async spawnAgentProcess(
     plan: AgentLaunchPlan,
+    startupStderr: string[],
   ): Promise<ChildProcessByStdio<Writable, Readable, Readable>> {
-    const lifelineHelper =
-      process.platform !== "win32"
-        ? await ensureLifelineHelper({ log: (message) => this.log(message) })
-        : undefined;
-    /**
-     * A killable process group only exists on POSIX, and only pays off once the
-     * lifeline helper is there to reap it; on Windows the agent is reached
-     * through the cmd.exe shim that buildAgentSpawnCommand assembles, so the
-     * group leader stays off and cleanup falls back to the plain child handle.
-     */
-    const agentGroupLeader = process.platform !== "win32" && lifelineHelper !== undefined;
     const spawnCommand = buildAgentSpawnCommand(
       plan.spawnCommand,
       plan.args,
       process.platform,
       plan.spawnOptions.env,
     );
+    const useLifeline = supportsProcessTreeLifeline();
+    const helper = useLifeline ? resolvePackagedLifelineHelper() : undefined;
+    if (useLifeline && !helper) {
+      throw new AgentSpawnError(
+        this.options.agentCommand,
+        new Error("trusted packaged lifeline helper is unavailable"),
+      );
+    }
+
     const spawnedChild = spawn(spawnCommand.command, spawnCommand.args, {
       ...plan.spawnOptions,
-      detached: agentGroupLeader,
+      detached: useLifeline,
       windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
     }) as ChildProcessByStdio<Writable, Readable, Readable>;
-    this.agentGroupLeader = agentGroupLeader;
+    spawnedChild.stderr.on("data", (chunk: Buffer | string) => {
+      this.captureStartupStderr(startupStderr, chunk);
+      if (this.options.verbose) {
+        process.stderr.write(chunk);
+      }
+    });
+    this.agentGroupLeader = useLifeline;
     try {
       await waitForSpawn(spawnedChild);
-      await this.startLifelineWatchdog(spawnedChild, lifelineHelper ?? null);
+      if (helper && spawnedChild.pid !== undefined) {
+        const watchdog = await startLifelineWatchdog(helper, spawnedChild.pid);
+        this.lifelineWatchdog = watchdog;
+        this.observeLifelineWatchdog(watchdog, spawnedChild);
+      }
     } catch (error) {
-      this.stopLifelineWatchdog();
+      if (useLifeline) {
+        await reapSpawnedProcessGroup(
+          spawnedChild,
+          AGENT_CLOSE_TERM_GRACE_MS,
+          AGENT_CLOSE_KILL_GRACE_MS,
+        );
+      }
+      this.agentGroupLeader = false;
       throw new AgentSpawnError(this.options.agentCommand, error);
     }
     return requireAgentStdio(spawnedChild);
   }
 
-  private async startLifelineWatchdog(
-    child: ChildProcess,
-    helperOverride?: string | null,
-  ): Promise<void> {
-    this.stopLifelineWatchdog();
-    if (!this.agentGroupLeader || child.pid === undefined) {
-      return;
-    }
-
-    const helper =
-      helperOverride === undefined
-        ? await ensureLifelineHelper({ log: (message) => this.log(message) })
-        : helperOverride;
-    if (!helper) {
-      return;
-    }
-
-    try {
-      /*
-       * The bridge is already spawned before this helper can inherit the pipe,
-       * so an owner SIGKILL in that tiny gap can still orphan it. Once the
-       * watchdog starts, pipe EOF is the owner identity and death signal.
-       */
-      const watchdog = spawn(helper, [String(child.pid)], {
-        detached: true,
-        stdio: ["pipe", "ignore", "ignore"],
-        windowsHide: true,
-      });
-      this.lifelineWatchdog = watchdog;
-      const clearWatchdog = () => {
-        if (this.lifelineWatchdog === watchdog) {
-          this.lifelineWatchdog = undefined;
-        }
-      };
-      await waitForSpawn(watchdog);
-      watchdog.once("exit", clearWatchdog);
-      watchdog.once("error", () => {
-        clearWatchdog();
-      });
-      watchdog.unref();
-    } catch {
-      // The watchdog is best-effort and only guards abrupt owner death. The bridge was
-      // already spawned detached, so agentGroupLeader stays true to preserve the group-kill
-      // on cooperative close; a failed watchdog only forgoes abrupt-death reaping for a plain
-      // owner-PID SIGKILL / crash / OOM, which an attached bridge would not survive either (the
-      // one case attaching would still cover is a group-wide `kill -9 -<owner-pgid>` / terminal
-      // SIGHUP). Downgrading agentGroupLeader here would instead break the close-time group-kill.
-      this.stopLifelineWatchdog();
-    }
+  private observeLifelineWatchdog(
+    watchdog: LifelineWatchdog,
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+  ): void {
+    watchdog.once("exit", () => {
+      if (this.lifelineWatchdog !== watchdog) {
+        return;
+      }
+      this.lifelineWatchdog = undefined;
+      if (!child.pid || !hasLiveProcessGroup(child.pid)) {
+        return;
+      }
+      this.log("lifeline exited while the bridge group was alive; forcing tree cleanup");
+      void reapSpawnedProcessGroup(
+        child,
+        AGENT_CLOSE_TERM_GRACE_MS,
+        AGENT_CLOSE_KILL_GRACE_MS,
+      ).finally(() => this.closeConnection());
+    });
   }
 
   private createConnection(
@@ -1122,11 +1109,7 @@ export class AcpClient {
         params.startupStderr,
       );
     } finally {
-      try {
-        await this.terminateInitializeFailedProcess(params.child);
-      } finally {
-        this.stopLifelineWatchdog();
-      }
+      await this.terminateAgentProcess(params.child);
     }
     if (params.launch.geminiAcp && error instanceof TimeoutError) {
       throw new GeminiAcpStartupTimeoutError(
@@ -1701,12 +1684,8 @@ export class AcpClient {
     await this.terminalManager.shutdown();
 
     const agent = this.agent;
-    try {
-      if (agent) {
-        await this.terminateAgentProcess(agent);
-      }
-    } finally {
-      this.stopLifelineWatchdog();
+    if (agent) {
+      await this.terminateAgentProcess(agent);
     }
     this.closeConnection();
     if (this.pendingConnectionRequests.size > 0) {
@@ -1746,7 +1725,6 @@ export class AcpClient {
     this.connection = undefined;
     this.agent = undefined;
     this.agentGroupLeader = false;
-    this.lifelineWatchdog = undefined;
   }
 
   private abortActiveElicitation(): void {
@@ -1763,50 +1741,27 @@ export class AcpClient {
     const stdinCloseGraceMs = resolveAgentCloseAfterStdinEndMs(this.options.agentCommand);
     this.endAgentStdin(child);
     let childExited = await waitForChildExit(child, stdinCloseGraceMs);
-
-    if (!childExited || this.hasLiveAgentProcessGroup(child)) {
+    let treeReaped = childExited && !this.hasLiveAgentProcessGroup(child);
+    if (!treeReaped) {
       this.signalAgentProcess(child, "SIGTERM");
-      const treeCleanedUp = await this.waitForAgentTreeCleanup(child, AGENT_CLOSE_TERM_GRACE_MS);
+      treeReaped = await this.waitForAgentTreeCleanup(child, AGENT_CLOSE_TERM_GRACE_MS);
       childExited = !isChildProcessRunning(child);
-
-      if (!treeCleanedUp) {
-        if (!childExited) {
-          this.log(`agent did not exit after ${AGENT_CLOSE_TERM_GRACE_MS}ms; forcing SIGKILL`);
-        }
-        this.signalAgentProcess(child, "SIGKILL");
-        await this.waitForAgentTreeCleanup(child, AGENT_CLOSE_KILL_GRACE_MS);
-        childExited = !isChildProcessRunning(child);
-      }
+    }
+    if (!treeReaped) {
+      this.log(`agent did not exit after ${AGENT_CLOSE_TERM_GRACE_MS}ms; forcing SIGKILL`);
+      this.signalAgentProcess(child, "SIGKILL");
+      treeReaped = await this.waitForAgentTreeCleanup(child, AGENT_CLOSE_KILL_GRACE_MS);
+      childExited = !isChildProcessRunning(child);
+    }
+    if (treeReaped) {
+      releaseLifelineWatchdog(this.lifelineWatchdog);
+      this.lifelineWatchdog = undefined;
+    } else {
+      this.log("bridge group cleanup is still unproved; leaving the lifeline armed");
     }
 
     // Ensure stdio handles don't keep this process alive after close() returns.
     this.detachAgentHandles(child, !childExited);
-  }
-
-  private async terminateInitializeFailedProcess(
-    child: ChildProcessByStdio<Writable, Readable, Readable>,
-  ): Promise<void> {
-    this.signalAgentProcess(child, "SIGTERM");
-    let exited = await waitForChildExit(child, AGENT_CLOSE_TERM_GRACE_MS);
-    if (!exited || this.agentGroupLeader) {
-      this.signalAgentProcess(child, "SIGKILL");
-      exited = (await waitForChildExit(child, AGENT_CLOSE_KILL_GRACE_MS)) || exited;
-    }
-    this.detachAgentHandles(child, !exited);
-  }
-
-  private stopLifelineWatchdog(): void {
-    const watchdog = this.lifelineWatchdog;
-    this.lifelineWatchdog = undefined;
-    if (!watchdog?.stdin || watchdog.stdin.destroyed) {
-      return;
-    }
-    try {
-      watchdog.stdin.once("error", () => {});
-      watchdog.stdin.end("R");
-    } catch {
-      // best effort
-    }
   }
 
   private endAgentStdin(child: ChildProcessByStdio<Writable, Readable, Readable>): void {
@@ -1825,7 +1780,7 @@ export class AcpClient {
     child: ChildProcessByStdio<Writable, Readable, Readable>,
     waitMs: number,
   ): Promise<boolean> {
-    if (this.agentGroupLeader && child.pid !== undefined && process.platform !== "win32") {
+    if (this.agentGroupLeader && child.pid !== undefined) {
       return await waitForChildAndProcessGroupExit(child, child.pid, waitMs);
     }
     return await waitForChildExit(child, waitMs);
@@ -1834,12 +1789,7 @@ export class AcpClient {
   private hasLiveAgentProcessGroup(
     child: ChildProcessByStdio<Writable, Readable, Readable>,
   ): boolean {
-    return (
-      this.agentGroupLeader &&
-      child.pid !== undefined &&
-      process.platform !== "win32" &&
-      hasLiveProcessGroup(child.pid)
-    );
+    return this.agentGroupLeader && child.pid !== undefined && hasLiveProcessGroup(child.pid);
   }
 
   private signalAgentProcess(
@@ -1848,14 +1798,10 @@ export class AcpClient {
   ): void {
     try {
       if (this.agentGroupLeader && child.pid !== undefined) {
-        // Detached Unix bridges lead their own process group (pgid == pid), so
-        // a negative PID targets only that group and its descendants. The
-        // agentGroupLeader gate prevents signaling acpx's own group.
         process.kill(-child.pid, signal);
         return;
       }
       child.kill(signal);
-      return;
     } catch {
       if (this.agentGroupLeader && !isChildProcessRunning(child)) {
         return;
@@ -2577,48 +2523,4 @@ export class AcpClient {
   }): Promise<void> {
     await this.waitForSessionUpdateDrain(options?.idleMs ?? 0, options?.timeoutMs ?? 0);
   }
-}
-
-async function waitForChildAndProcessGroupExit(
-  child: ChildProcess,
-  processGroupId: number,
-  timeoutMs: number,
-): Promise<boolean> {
-  const deadline = Date.now() + Math.max(0, timeoutMs);
-
-  while (true) {
-    if (!isChildProcessRunning(child) && !hasLiveProcessGroup(processGroupId)) {
-      return true;
-    }
-
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) {
-      return false;
-    }
-
-    await delay(Math.min(DRAIN_POLL_INTERVAL_MS, remainingMs));
-  }
-}
-
-function hasLiveProcessGroup(processGroupId: number): boolean {
-  try {
-    process.kill(-processGroupId, 0);
-    return true;
-  } catch (error) {
-    return getErrorCode(error) === "EPERM";
-  }
-}
-
-function getErrorCode(error: unknown): string | undefined {
-  if (typeof error !== "object" || error === null || !("code" in error)) {
-    return undefined;
-  }
-  const code = error.code;
-  return typeof code === "string" ? code : undefined;
-}
-
-async function delay(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
 }

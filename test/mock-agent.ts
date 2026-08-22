@@ -86,6 +86,8 @@ type MockAgentOptions = {
   /** If set, the agent spawns a long-lived child and writes its PID to this path. */
   grandchildPidFile?: string;
   grandchildIgnoreSigterm: boolean;
+  /** If set, the agent writes a marker after it receives a prompt. */
+  promptStartMarker?: string;
 };
 
 type SessionState = {
@@ -413,6 +415,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let pidFile: string | undefined;
   let grandchildPidFile: string | undefined;
   let grandchildIgnoreSigterm = false;
+  let promptStartMarker: string | undefined;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -594,6 +597,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
       continue;
     }
 
+    if (token === "--prompt-start-marker") {
+      promptStartMarker = parseOptionValue(argv, index + 1, token);
+      index += 1;
+      continue;
+    }
+
     if (token === "--claude-agent-acp") {
       continue;
     }
@@ -667,6 +676,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     pidFile,
     grandchildPidFile,
     grandchildIgnoreSigterm,
+    promptStartMarker,
   };
 }
 
@@ -1009,6 +1019,9 @@ class MockAgent implements Agent {
     const promptAbort = new AbortController();
     session.pendingPrompt = promptAbort;
     const text = getPromptText(params.prompt);
+    if (this.options.promptStartMarker) {
+      writeFileSync(this.options.promptStartMarker, `${process.pid}\n`, "utf8");
+    }
 
     if (text === "partial-retryable-error") {
       try {

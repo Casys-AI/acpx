@@ -161,6 +161,16 @@ Queue mechanics:
 - Override TTL with `--ttl <seconds>`. `--ttl 0` keeps it alive indefinitely (until idle shutdown is otherwise triggered).
 - Owner generation IDs are cryptographically random so rapid restarts cannot reuse a stale generation token.
 
+### Bridge process lifeline
+
+On macOS and Linux, a source build places a small native lifeline and its host manifest under `dist/native` inside the `acpx` package. Before ACP initialization, `acpx` validates that exact package-relative executable, its ownership and permissions, host platform and architecture, and SHA-256 digest. It then requires an `ARMED` pipe handshake. A missing, substituted, incompatible, or non-arming helper fails the agent start; `acpx` does not continue with an unprotected detached bridge.
+
+After the handshake, abrupt queue-owner death closes the pipe. The lifeline sends `SIGTERM` to the bridge process group, waits briefly, and retries `SIGKILL` for a bounded interval. Normal shutdown uses the existing cooperative stdin close and the same group cleanup, then releases the lifeline only after group absence is proved. A bridge crash also triggers cleanup of descendants left in its group. The bounded retry prevents an unreaped, zombie-only process group from pinning the lifeline itself; orphan-zombie reaping remains the responsibility of the operating system's init or container supervisor.
+
+The containment boundary is the POSIX process group. A descendant that deliberately creates a new session or process group can escape it, and terminal processes managed through ACP remain under the separate terminal-manager cleanup path. The historical topology also has a narrow interval between spawning the detached bridge and arming the lifeline; eliminating that interval requires making the native component the bridge launcher. Windows retains direct cooperative child shutdown and does not currently provide the abrupt-owner guarantee.
+
+The native executable is built for the host that runs `build` or `prepack`. The current single-host npm release workflow does not assemble a macOS/Linux architecture matrix, and the manifest gates OS and architecture but does not certify libc ABI compatibility. A published tarball is therefore supported only on the build host's OS and architecture with a compatible ABI. Local source builds on supported hosts produce the matching helper.
+
 ## --no-wait
 
 By default the submitter blocks until the queued prompt completes, streaming events back. `--no-wait` returns as soon as the running queue owner acknowledges the submission. Useful for scripted "queue up follow-ups" patterns.
