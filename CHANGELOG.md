@@ -12,6 +12,8 @@ Repo: https://github.com/openclaw/acpx
 
 ### Fixes
 
+- Sessions/hardening: keep session records and indexes private across atomic rewrites, including embedded file stores.
+
 ## 0.16.0 - 2026-09-15
 
 **Highlights:** Embedding hosts can share session-specific tools and turn-owned approvals, recover stored handles, and shut down connections while preserving existing sessions.
