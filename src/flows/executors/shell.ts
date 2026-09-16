@@ -1,6 +1,24 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { TimeoutError } from "../../async-control.js";
 import type { ShellActionExecution, ShellActionResult } from "../runtime.js";
+import { createShellOutputCapture, validateShellActionMaxBufferBytes } from "./shell-output.js";
+import { hasShellProcesses, stopShellProcess } from "./shell-process.js";
+
+function writeShellStdin(child: ChildProcess, stdin: string | undefined): void {
+  const stream = child.stdin;
+  if (!stream) {
+    return;
+  }
+  stream.on("error", () => {
+    // A child may close its input early; its exit status remains authoritative.
+  });
+  if (stdin != null && stream.writable && !stream.writableEnded) {
+    stream.write(stdin);
+  }
+  if (stream.writable && !stream.writableEnded) {
+    stream.end();
+  }
+}
 
 export function formatShellActionSummary(spec: ShellActionExecution): string {
   return `shell: ${renderShellCommand(spec.command, spec.args ?? [])}`;
@@ -25,14 +43,54 @@ function createShellFailureError(
   );
 }
 
+/**
+ * Resolve a shell-action timeout.
+ * Non-positive values match withTimeout: no deadline (undefined).
+ * Positive values arm SIGTERM/SIGKILL after that many ms.
+ */
+export function resolveShellActionTimeoutMs(timeoutMs: number | undefined): number | undefined {
+  if (timeoutMs == null || !(timeoutMs > 0)) {
+    return undefined;
+  }
+  return timeoutMs;
+}
+
+export type ShellProcessOwner = {
+  cancel: (signal: NodeJS.Signals) => Promise<void>;
+  release: () => void;
+};
+
+export type RunShellActionOptions = {
+  /** Cancellation waits for the owned process tree to terminate. */
+  signal?: AbortSignal;
+  terminationSignal?: NodeJS.Signals;
+  registerOwner?: (owner: ShellProcessOwner) => () => void;
+};
+
+export async function withShellAbort<T>(run: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  let rejectAbort: (reason: unknown) => void = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const onAbort = () => rejectAbort(signal.reason);
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    return await Promise.race([run(), aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 function rejectIfShellFailed(
   spec: ShellActionExecution,
   args: string[],
   result: ShellActionResult,
   timedOut: boolean,
+  timeoutMs: number | undefined,
 ): Error | undefined {
   if (timedOut) {
-    return new TimeoutError(spec.timeoutMs ?? 0);
+    return new TimeoutError(timeoutMs ?? spec.timeoutMs ?? 0);
   }
   if (((result.exitCode ?? 0) !== 0 || result.signal != null) && spec.allowNonZeroExit !== true) {
     return createShellFailureError(spec, args, result.exitCode, result.signal, result.stderr);
@@ -40,38 +98,48 @@ function rejectIfShellFailed(
   return undefined;
 }
 
-export async function runShellAction(spec: ShellActionExecution): Promise<ShellActionResult> {
-  const cwd = spec.cwd ?? process.cwd();
-  const args = spec.args ?? [];
-  const startMs = Date.now();
-  const child = spawn(spec.command, args, {
-    cwd,
-    env: {
-      ...process.env,
-      ...spec.env,
-    },
-    shell: spec.shell,
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-  });
+function waitForShellExit(
+  child: ChildProcess,
+  spec: ShellActionExecution,
+  args: string[],
+  cwd: string,
+  startMs: number,
+  timeoutMs: number | undefined,
+  termination: { timedOut: () => boolean; cancel: ShellProcessOwner["cancel"] },
+): Promise<ShellActionResult> {
+  const stdoutStream = child.stdout;
+  const stderrStream = child.stderr;
+  if (!stdoutStream || !stderrStream) {
+    throw new Error("Shell action child is missing stdio pipes");
+  }
 
-  let stdout = "";
-  let stderr = "";
-  let timedOut = false;
-  let timeout: NodeJS.Timeout | undefined;
-
-  const finish = new Promise<ShellActionResult>((resolve, reject) => {
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
+  return new Promise<ShellActionResult>((resolve, reject) => {
+    let settled = false;
+    const fail = (error: unknown) => {
+      settled = true;
+      reject(error);
+    };
+    const capture = createShellOutputCapture(
+      spec.maxBufferBytes,
+      () => settled || termination.timedOut(),
+      (error) => {
+        fail(error);
+        void termination.cancel("SIGTERM").catch(fail);
+      },
+    );
+    stdoutStream.setEncoding("utf8");
+    stderrStream.setEncoding("utf8");
+    stdoutStream.on("data", (chunk: string) => {
+      capture.append("stdout", chunk);
     });
-    child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
+    stderrStream.on("data", (chunk: string) => {
+      capture.append("stderr", chunk);
     });
 
-    child.once("error", reject);
+    child.once("error", fail);
     child.once("exit", (exitCode, signal) => {
+      settled = true;
+      const { stdout, stderr } = capture.output;
       const result: ShellActionResult = {
         command: spec.command,
         args,
@@ -84,7 +152,7 @@ export async function runShellAction(spec: ShellActionExecution): Promise<ShellA
         durationMs: Date.now() - startMs,
       };
 
-      const error = rejectIfShellFailed(spec, args, result, timedOut);
+      const error = rejectIfShellFailed(spec, args, result, termination.timedOut(), timeoutMs);
       if (error) {
         reject(error);
         return;
@@ -93,27 +161,125 @@ export async function runShellAction(spec: ShellActionExecution): Promise<ShellA
       resolve(result);
     });
   });
+}
 
-  if (spec.stdin != null) {
-    child.stdin.write(spec.stdin);
-  }
-  child.stdin.end();
-
-  if (spec.timeoutMs != null && spec.timeoutMs > 0) {
-    timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => {
-        child.kill("SIGKILL");
-      }, 1_000).unref();
-    }, spec.timeoutMs);
-  }
-
-  try {
-    return await finish;
-  } finally {
-    if (timeout) {
-      clearTimeout(timeout);
+function createShellTermination(
+  child: ChildProcess,
+  timeoutMs: number | undefined,
+  options: RunShellActionOptions,
+) {
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  let rejectCleanup: (error: unknown) => void = () => {};
+  const cleanupFailure = new Promise<never>((_resolve, reject) => {
+    rejectCleanup = reject;
+  });
+  let termination: Promise<void> | undefined;
+  let timedOut = false;
+  let released = false;
+  let deadline: NodeJS.Timeout | undefined;
+  let monitor: NodeJS.Timeout | undefined;
+  let unregister: (() => void) | undefined;
+  const clearDeadline = () => {
+    if (deadline) {
+      clearTimeout(deadline);
     }
+  };
+  const release = () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    clearDeadline();
+    if (monitor) {
+      clearInterval(monitor);
+    }
+    options.signal?.removeEventListener("abort", onAbort);
+    unregister?.();
+  };
+  const cancel = (signal: NodeJS.Signals): Promise<void> => {
+    if (termination) {
+      return termination;
+    }
+    if (released) {
+      return Promise.resolve();
+    }
+    timedOut = true;
+    termination = stopShellProcess(child, closed, signal).finally(release);
+    void termination.catch(rejectCleanup);
+    return termination;
+  };
+  const onAbort = () => {
+    void cancel(options.terminationSignal ?? "SIGTERM");
+  };
+  options.signal?.addEventListener("abort", onAbort, { once: true });
+  if (timeoutMs != null) {
+    deadline = setTimeout(() => {
+      void cancel("SIGTERM");
+    }, timeoutMs);
+  }
+  unregister = options.registerOwner?.({ cancel, release });
+  if (unregister) {
+    child.once("close", () => {
+      if (released || termination) {
+        return;
+      }
+      const prune = () => {
+        if (!termination && !hasShellProcesses(child)) {
+          release();
+        }
+      };
+      monitor = setInterval(prune, 100);
+      monitor.unref();
+      prune();
+    });
+  }
+  return {
+    cancel,
+    timedOut: () => timedOut,
+    cleanupFailure,
+    async dispose() {
+      clearDeadline();
+      try {
+        await termination;
+      } finally {
+        if (!unregister) {
+          release();
+        }
+      }
+    },
+  };
+}
+
+export async function runShellAction(
+  spec: ShellActionExecution,
+  options: RunShellActionOptions = {},
+): Promise<ShellActionResult> {
+  if (options?.signal?.aborted) {
+    throw options.signal.reason;
+  }
+  const cwd = spec.cwd ?? process.cwd();
+  const args = spec.args ?? [];
+  const startMs = Date.now();
+  const timeoutMs = resolveShellActionTimeoutMs(spec.timeoutMs);
+  validateShellActionMaxBufferBytes(spec.maxBufferBytes);
+  const child = spawn(spec.command, args, {
+    cwd,
+    env: {
+      ...process.env,
+      ...spec.env,
+    },
+    shell: spec.shell,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    detached: process.platform !== "win32",
+  });
+
+  const termination = createShellTermination(child, timeoutMs, options);
+  const finish = waitForShellExit(child, spec, args, cwd, startMs, timeoutMs, termination);
+  writeShellStdin(child, spec.stdin);
+  try {
+    return await Promise.race([finish, termination.cleanupFailure]);
+  } finally {
+    await termination.dispose();
   }
 }

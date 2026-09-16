@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { getEventListeners } from "node:events";
 import path from "node:path";
-import { PassThrough } from "node:stream";
-import test from "node:test";
-import type { RequestPermissionRequest, RequestPermissionResponse } from "@agentclientprotocol/sdk";
+import { PassThrough, type Readable, type Writable } from "node:stream";
+import test, { type TestContext } from "node:test";
+import type {
+  AnyMessage,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+} from "@agentclientprotocol/sdk";
 import {
   AcpClient,
   buildAgentSpawnOptions,
@@ -14,12 +20,14 @@ import {
 } from "../src/acp/client.js";
 import {
   AgentDisconnectedError,
+  AgentSpawnError,
   AgentStartupError,
   AuthPolicyError,
   PermissionDeniedError,
   PermissionPromptUnavailableError,
   UnsupportedPromptContentError,
 } from "../src/errors.js";
+import type { AcpProcessStarted } from "../src/types.js";
 
 test("parseAcpJsonMessageLine ignores non-object JSON values", () => {
   for (const line of ["1", "null", '"diagnostic"', "[]", "[{}]"]) {
@@ -35,6 +43,20 @@ test("parseAcpJsonMessageLine preserves object-shaped protocol values", () => {
 });
 
 type ClientInternals = {
+  createTappedStream?: (base: {
+    readable: ReadableStream<AnyMessage>;
+    writable: WritableStream<AnyMessage>;
+  }) => {
+    readable: ReadableStream<AnyMessage>;
+    writable: WritableStream<AnyMessage>;
+  };
+  createConnection?: (
+    stream: {
+      readable: ReadableStream<AnyMessage>;
+      writable: WritableStream<AnyMessage>;
+    },
+    launch: { devinAcp: boolean },
+  ) => unknown;
   selectAuthMethod?: (methods: Array<{ id: string }>) =>
     | {
         methodId: string;
@@ -79,6 +101,11 @@ type ClientInternals = {
     exitCode: number | null,
     signal: NodeJS.Signals | null,
   ) => void;
+  attachAgentLifecycleObservers?: (
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+    startedProcess: AcpProcessStarted,
+    exitNotificationBarrier: Promise<void>,
+  ) => void;
   filesystem?: {
     readTextFile: (params: {
       sessionId: string;
@@ -117,6 +144,7 @@ type ClientInternals = {
     | {
         sessionId: string;
         promise: Promise<{ stopReason: "end_turn" | "cancelled" }>;
+        elicitationController?: AbortController;
       }
     | undefined;
   cancellingSessionIds: Set<string>;
@@ -626,10 +654,8 @@ test("AcpClient onPermissionRequest receives an AbortSignal that fires on sessio
   assert(observedSignal instanceof AbortSignal);
   assert.equal(observedSignal?.aborted, false);
 
-  const internals = asInternals(client) as unknown as {
-    abortAndDropPermissionSignal: (sessionId: string) => void;
-  };
-  internals.abortAndDropPermissionSignal("session-cb-4");
+  asInternals(client).connection = { cancel: async () => {} };
+  await client.cancel("session-cb-4");
   assert.equal(observedSignal?.aborted, true);
 });
 
@@ -652,17 +678,15 @@ test("AcpClient onPermissionRequest cancels a late decision after session cancel
       return await decisionPromise;
     },
   });
-  const internals = asInternals(client) as ClientInternals & {
-    abortAndDropPermissionSignal: (sessionId: string) => void;
-  };
+  const internals = asInternals(client);
+  internals.connection = { cancel: async () => {} };
 
   const responsePromise = internals.handlePermissionRequest?.(
     makePermissionRequest("session-cb-5", "edit"),
   );
   await callbackStartedPromise;
 
-  internals.cancellingSessionIds.add("session-cb-5");
-  internals.abortAndDropPermissionSignal("session-cb-5");
+  await client.cancel("session-cb-5");
   assert.equal(observedSignal?.aborted, true);
 
   resolveDecision({ outcome: "allow_once" });
@@ -696,17 +720,15 @@ test("AcpClient onPermissionRequest treats abort rejections as cancelled", async
       });
     },
   });
-  const internals = asInternals(client) as ClientInternals & {
-    abortAndDropPermissionSignal: (sessionId: string) => void;
-  };
+  const internals = asInternals(client);
+  internals.connection = { cancel: async () => {} };
 
   const responsePromise = internals.handlePermissionRequest?.(
     makePermissionRequest("session-cb-6", "edit"),
   );
   await callbackStartedPromise;
 
-  internals.cancellingSessionIds.add("session-cb-6");
-  internals.abortAndDropPermissionSignal("session-cb-6");
+  await client.cancel("session-cb-6");
   const response = await responsePromise;
 
   assert.deepEqual(response, {
@@ -1204,6 +1226,613 @@ test("AcpClient lifecycle snapshot and cancel helpers reflect active prompt stat
   assert.deepEqual(cancelled, { stopReason: "cancelled" });
 });
 
+test(
+  "AcpClient coalesces cancellation until the active prompt finishes",
+  { timeout: 5_000 },
+  async (t) => {
+    const fixture = createCancellationFixture(t);
+    const { client } = fixture;
+    const first = fixture.prompt("session-cancel", "first");
+    await fixture.message(0);
+
+    assert.deepEqual(
+      await Promise.all([
+        client.cancel("session-cancel"),
+        client.requestCancelActivePrompt(),
+        client.cancelActivePrompt(0),
+      ]),
+      [undefined, true, undefined],
+    );
+    assert.equal(await client.requestCancelActivePrompt(), true);
+    assert.deepEqual(
+      fixture.messages.map((message) => "method" in message && message.method),
+      ["session/prompt", "session/cancel"],
+    );
+    await fixture.reply(await fixture.message(0));
+    await first;
+    assert.equal(await client.requestCancelActivePrompt(), false);
+    assert.equal(await client.cancelActivePrompt(0), undefined);
+    assert.equal(fixture.messages.length, 2);
+
+    const second = fixture.prompt("session-cancel", "second");
+    await fixture.message(2);
+    const waiting = fixture.track(client.cancelActivePrompt(5_000));
+    await fixture.message(3);
+    await fixture.reply(await fixture.message(2));
+    assert.deepEqual(await waiting, { stopReason: "end_turn" });
+    await second;
+    assert.equal(fixture.messages.length, 4);
+
+    await client.cancel("inactive-session");
+    assert.deepEqual(fixture.messages[4], {
+      jsonrpc: "2.0",
+      method: "session/cancel",
+      params: { sessionId: "inactive-session" },
+    });
+  },
+);
+
+test(
+  "AcpClient cancellation of another session leaves the active prompt available",
+  { timeout: 5_000 },
+  async (t) => {
+    let permissionSignal: AbortSignal | undefined;
+    const fixture = createCancellationFixture(t, {
+      client: {
+        onPermissionRequest: async (_request, { signal }) => {
+          permissionSignal = signal;
+          return { outcome: "allow_once" };
+        },
+      },
+    });
+    const { client } = fixture;
+    const prompt = fixture.prompt("session-active", "hello");
+    const request = await fixture.message(0);
+    await fixture.permission("session-active");
+    assert(permissionSignal);
+    await client.cancel("session-other");
+    assert.equal(client.hasActivePrompt("session-active"), true);
+    assert.equal(permissionSignal.aborted, false);
+    assert.deepEqual(fixture.messages[1], {
+      jsonrpc: "2.0",
+      method: "session/cancel",
+      params: { sessionId: "session-other" },
+    });
+
+    assert.equal(await client.requestCancelActivePrompt(), true);
+    assert.equal(permissionSignal.aborted, true);
+    assert.deepEqual(fixture.messages[2], {
+      jsonrpc: "2.0",
+      method: "session/cancel",
+      params: { sessionId: "session-active" },
+    });
+    assert.equal(fixture.messages.length, 3);
+    await fixture.reply(request);
+    await prompt;
+  },
+);
+
+test(
+  "AcpClient coalesces synchronous elicitation and permission abort reentry",
+  { timeout: 5_000 },
+  async (t) => {
+    const reentered: Array<Promise<boolean>> = [];
+    const fixture = createCancellationFixture(t, {
+      client: {
+        onPermissionRequest: async (_request, { signal }) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              reentered.push(fixture.track(fixture.client.requestCancelActivePrompt()));
+            },
+            { once: true },
+          );
+          return { outcome: "allow_once" };
+        },
+      },
+    });
+    const { client } = fixture;
+    const prompt = fixture.prompt("session-reentry", "hello");
+    await fixture.message(0);
+    await fixture.permission("session-reentry");
+    const active = asInternals(client).activePrompt;
+    assert(active?.elicitationController);
+    active.elicitationController.signal.addEventListener(
+      "abort",
+      () => {
+        reentered.push(fixture.track(client.requestCancelActivePrompt()));
+      },
+      { once: true },
+    );
+
+    await client.cancel("session-reentry");
+    assert.equal(reentered.length, 2);
+    assert.deepEqual(await Promise.all(reentered), [true, true]);
+    assert.deepEqual(
+      fixture.messages.map((message) => "method" in message && message.method),
+      ["session/prompt", "session/cancel"],
+    );
+    await fixture.reply(await fixture.message(0));
+    await prompt;
+  },
+);
+
+test(
+  "AcpClient queues cancellation before an abort listener starts the next prompt",
+  { timeout: 5_000 },
+  async (t) => {
+    const fixture = createCancellationFixture(t);
+    const { client } = fixture;
+    const first = fixture.prompt("session-next", "first");
+    await fixture.message(0);
+    const active = asInternals(client).activePrompt;
+    assert(active?.elicitationController);
+    let second: Promise<unknown> | undefined;
+    active.elicitationController.signal.addEventListener(
+      "abort",
+      () => {
+        second = fixture.prompt("session-next", "second");
+      },
+      { once: true },
+    );
+
+    await client.cancel("session-next");
+    const secondRequest = await fixture.message(2);
+    assert.deepEqual(
+      fixture.messages.map((message) => "method" in message && message.method),
+      ["session/prompt", "session/cancel", "session/prompt"],
+    );
+    assert(second);
+    await fixture.reply(await fixture.message(0));
+    await fixture.reply(secondRequest);
+    await Promise.all([first, second]);
+  },
+);
+
+test(
+  "AcpClient queues a replacement prompt before abort listeners cancel its owner",
+  { timeout: 5_000 },
+  async (t) => {
+    const releaseSecondWrite = createDeferred<void>();
+    let promptsWritten = 0;
+    const fixture = createCancellationFixture(t, {
+      async write(message) {
+        if ("method" in message && message.method === "session/prompt" && ++promptsWritten === 2) {
+          await releaseSecondWrite.promise;
+        }
+      },
+      release: () => releaseSecondWrite.resolve(),
+    });
+    const { client } = fixture;
+    const first = fixture.prompt("session-replaced", "first");
+    await fixture.message(0);
+    const active = asInternals(client).activePrompt;
+    assert(active?.elicitationController);
+    let cancellation: Promise<boolean> | undefined;
+    active.elicitationController.signal.addEventListener(
+      "abort",
+      () => {
+        cancellation = fixture.track(client.requestCancelActivePrompt());
+      },
+      { once: true },
+    );
+
+    const second = fixture.prompt("session-replaced", "second");
+    const secondRequest = await fixture.message(1);
+    assert("method" in secondRequest);
+    assert.equal(secondRequest.method, "session/prompt");
+    assert.equal(fixture.messages.length, 2);
+    assert(cancellation);
+    releaseSecondWrite.resolve();
+    assert.equal(await cancellation, true);
+    assert.equal(await client.requestCancelActivePrompt(), true);
+    assert.deepEqual(
+      fixture.messages.map((message) => "method" in message && message.method),
+      ["session/prompt", "session/prompt", "session/cancel"],
+    );
+    await fixture.reply(await fixture.message(0));
+    await fixture.reply(secondRequest);
+    await Promise.all([first, second]);
+  },
+);
+
+test(
+  "AcpClient shares a failed cancellation attempt but permits an explicit retry",
+  { timeout: 5_000 },
+  async (t) => {
+    const attempt = createDeferred<void>();
+    const called = createDeferred<void>();
+    const fixture = createCancellationFixture(t, { release: () => attempt.resolve() });
+    const { client } = fixture;
+    const prompt = fixture.prompt("session-retry", "hello");
+    await fixture.message(0);
+    const connection = asInternals(client).connection as {
+      cancel: (params: { sessionId: string }) => Promise<void>;
+    };
+    const sendCancel = connection.cancel;
+    let calls = 0;
+    connection.cancel = (params) => {
+      calls += 1;
+      if (calls === 1) {
+        called.resolve();
+        return attempt.promise;
+      }
+      return sendCancel(params);
+    };
+    const failure = new Error("cancel was not enqueued");
+    const results = fixture.track(
+      Promise.allSettled([client.cancel("session-retry"), client.requestCancelActivePrompt()]),
+    );
+    await called.promise;
+    assert.equal(calls, 1);
+    attempt.reject(failure);
+    for (const result of await results) {
+      assert(result.status === "rejected");
+      assert.equal(result.reason, failure);
+    }
+
+    assert.equal(await client.requestCancelActivePrompt(), true);
+    assert.equal(await client.requestCancelActivePrompt(), true);
+    assert.equal(calls, 2);
+    assert.deepEqual(
+      fixture.messages.map((message) => "method" in message && message.method),
+      ["session/prompt", "session/cancel"],
+    );
+    await fixture.reply(await fixture.message(0));
+    await prompt;
+  },
+);
+
+test(
+  "AcpClient keeps a successor cancellation when an older attempt rejects",
+  { timeout: 5_000 },
+  async (t) => {
+    const oldAttempt = createDeferred<void>();
+    const oldCalled = createDeferred<void>();
+    const releaseNewSend = createDeferred<void>();
+    const fixture = createCancellationFixture(t, {
+      async write(message) {
+        if ("method" in message && message.method === "session/cancel") {
+          await releaseNewSend.promise;
+        }
+      },
+      release() {
+        oldAttempt.resolve();
+        releaseNewSend.resolve();
+      },
+    });
+    const { client } = fixture;
+    const first = fixture.prompt("session-isolation", "first");
+    await fixture.message(0);
+    const connection = asInternals(client).connection as {
+      cancel: (params: { sessionId: string }) => Promise<void>;
+    };
+    const sendCancel = connection.cancel;
+    let calls = 0;
+    connection.cancel = (params) => {
+      calls += 1;
+      if (calls === 1) {
+        oldCalled.resolve();
+        return oldAttempt.promise;
+      }
+      return sendCancel(params);
+    };
+    const oldResult = fixture.track(Promise.allSettled([client.requestCancelActivePrompt()]));
+    await oldCalled.promise;
+    const second = fixture.prompt("session-isolation", "second");
+    const secondRequest = await fixture.message(1);
+    const newer = fixture.track(client.requestCancelActivePrompt());
+    await fixture.message(2);
+    const failure = new Error("old cancel was not enqueued");
+    oldAttempt.reject(failure);
+    const [result] = await oldResult;
+    assert(result?.status === "rejected");
+    assert.equal(result.reason, failure);
+    const repeated = fixture.track(client.requestCancelActivePrompt());
+    releaseNewSend.resolve();
+    assert.deepEqual(await Promise.all([newer, repeated]), [true, true]);
+    assert.equal(calls, 2);
+    assert.deepEqual(
+      fixture.messages.map((message) => "method" in message && message.method),
+      ["session/prompt", "session/prompt", "session/cancel"],
+    );
+    await fixture.reply(await fixture.message(0));
+    await fixture.reply(secondRequest);
+    await Promise.all([first, second]);
+  },
+);
+
+for (const mode of ["same-session-live", "same-session-cancelled", "different-session"]) {
+  test(
+    "AcpClient preserves successor permission ownership: " + mode,
+    { timeout: 5_000 },
+    async (t) => {
+      const signals: AbortSignal[] = [];
+      const fixture = createCancellationFixture(t, {
+        client: {
+          onPermissionRequest: async (_request, { signal }) => {
+            signals.push(signal);
+            return { outcome: "allow_once" };
+          },
+        },
+      });
+      const { client } = fixture;
+      const first = fixture.prompt("session-old", "first");
+      const firstRequest = await fixture.message(0);
+      await fixture.permission("session-old");
+      const nextSession = mode === "different-session" ? "session-other" : "session-old";
+      const second = fixture.prompt(nextSession, "second");
+      const secondRequest = await fixture.message(1);
+      await fixture.permission(nextSession);
+      assert.equal(signals.length, 2);
+      if (mode === "same-session-cancelled") {
+        await client.cancel(nextSession);
+      }
+
+      await fixture.reply(firstRequest);
+      await first;
+      if (mode === "same-session-cancelled") {
+        assert.deepEqual(await fixture.permission(nextSession), {
+          outcome: { outcome: "cancelled" },
+        });
+        assert.equal(signals.length, 2);
+      } else {
+        assert.equal(signals[1]?.aborted, false);
+        assert.equal(signals[0]?.aborted, mode === "different-session");
+        await client.cancel(nextSession);
+        assert.equal(signals[1]?.aborted, true);
+      }
+      assert.deepEqual(await fixture.permission(nextSession), {
+        outcome: { outcome: "cancelled" },
+      });
+      assert.equal(signals.length, 2);
+      await fixture.reply(secondRequest);
+      await second;
+    },
+  );
+}
+
+for (const completion of ["older", "newer"]) {
+  test(
+    "AcpClient preserves pending session permissions behind another active session: " + completion,
+    { timeout: 5_000 },
+    async (t) => {
+      const permissionEntered = createDeferred<AbortSignal>();
+      const releasePermission = createDeferred<void>();
+      const fixture = createCancellationFixture(t, {
+        client: {
+          onPermissionRequest: async (_request, { signal }) => {
+            permissionEntered.resolve(signal);
+            await releasePermission.promise;
+            return { outcome: "allow_once" };
+          },
+        },
+        release: () => releasePermission.resolve(),
+      });
+      const first = fixture.prompt("session-overlap", "first");
+      const firstRequest = await fixture.message(0);
+      const second = fixture.prompt("session-overlap", "second");
+      const secondRequest = await fixture.message(1);
+      const permission = fixture.permission("session-overlap");
+      const signal = await permissionEntered.promise;
+      const third = fixture.prompt("session-other", "third");
+      const thirdRequest = await fixture.message(2);
+      const finishOlder = completion === "older";
+
+      await fixture.reply(finishOlder ? firstRequest : secondRequest);
+      await (finishOlder ? first : second);
+      releasePermission.resolve();
+      assert.deepEqual(
+        await permission,
+        finishOlder
+          ? { outcome: { outcome: "selected", optionId: "allow" } }
+          : { outcome: { outcome: "cancelled" } },
+      );
+      assert.equal(signal.aborted, !finishOlder);
+
+      await fixture.reply(finishOlder ? secondRequest : firstRequest);
+      await (finishOlder ? second : first);
+      assert.equal(signal.aborted, true);
+      await fixture.reply(thirdRequest);
+      await third;
+    },
+  );
+}
+
+for (const phase of ["cancel", "settle"]) {
+  test(
+    "AcpClient detaches permission ownership before " + phase + " callbacks",
+    { timeout: 5_000 },
+    async (t) => {
+      const signals: AbortSignal[] = [];
+      const fixture = createCancellationFixture(t, {
+        client: {
+          onPermissionRequest: async (_request, { signal }) => {
+            signals.push(signal);
+            return { outcome: "allow_once" };
+          },
+        },
+      });
+      const { client } = fixture;
+      const first = fixture.prompt("session-callback", "first");
+      const firstRequest = await fixture.message(0);
+      await fixture.permission("session-callback");
+      const active = asInternals(client).activePrompt;
+      assert(active?.elicitationController);
+      let second: Promise<unknown> | undefined;
+      let nextPermission: Promise<RequestPermissionResponse> | undefined;
+      active.elicitationController.signal.addEventListener(
+        "abort",
+        () => {
+          second = fixture.prompt("session-callback", "second");
+          nextPermission = fixture.permission("session-callback");
+        },
+        { once: true },
+      );
+
+      if (phase === "cancel") {
+        await client.cancel("session-callback");
+      } else {
+        await fixture.reply(firstRequest);
+        await first;
+      }
+      const secondRequest = await fixture.message(phase === "cancel" ? 2 : 1);
+      assert(second);
+      assert(nextPermission);
+      assert.deepEqual(await nextPermission, {
+        outcome: { outcome: "selected", optionId: "allow" },
+      });
+      assert.equal(signals.length, 2);
+      assert.notEqual(signals[0], signals[1]);
+      assert.equal(signals[0]?.aborted, true);
+      assert.equal(signals[1]?.aborted, false);
+      await client.cancel("session-callback");
+      assert.equal(signals[1]?.aborted, true);
+
+      if (phase === "cancel") {
+        await fixture.reply(firstRequest);
+        await first;
+      }
+      await fixture.reply(secondRequest);
+      await second;
+    },
+  );
+}
+
+test("AcpClient reports prompt readiness only after the transport accepts the request", async () => {
+  const writeEntered = createDeferred<AnyMessage>();
+  const releaseWrite = createDeferred<void>();
+  const requestWritten = createDeferred<void>();
+  const agentToClient = new TransformStream<AnyMessage>();
+  const client = makeClient();
+  connectClientToStream(client, {
+    readable: agentToClient.readable,
+    writable: new WritableStream<AnyMessage>({
+      async write(message) {
+        writeEntered.resolve(message);
+        await releaseWrite.promise;
+      },
+    }),
+  });
+
+  let readinessCalls = 0;
+  const prompt = client.prompt("session-write-ready", "hello", () => {
+    readinessCalls += 1;
+    requestWritten.resolve();
+  });
+  const request = await writeEntered.promise;
+
+  assert.equal(readinessCalls, 0);
+  releaseWrite.resolve();
+  await requestWritten.promise;
+  assert.equal(readinessCalls, 1);
+
+  await writeAgentMessage(agentToClient.writable, promptResponseFor(request));
+  assert.deepEqual(await prompt, { stopReason: "end_turn" });
+});
+
+test("AcpClient rejects a failed prompt write without reporting readiness", async () => {
+  const writeEntered = createDeferred<void>();
+  const failWrite = createDeferred<void>();
+  const agentToClient = new TransformStream<AnyMessage>();
+  const client = makeClient();
+  connectClientToStream(client, {
+    readable: agentToClient.readable,
+    writable: new WritableStream<AnyMessage>({
+      async write() {
+        writeEntered.resolve();
+        await failWrite.promise;
+      },
+    }),
+  });
+
+  let readinessCalls = 0;
+  const prompt = client.prompt("session-write-failed", "hello", () => {
+    readinessCalls += 1;
+  });
+
+  await writeEntered.promise;
+  failWrite.reject(new Error("transport write failed"));
+  await assert.rejects(prompt, /transport write failed/);
+  assert.equal(readinessCalls, 0);
+});
+
+test("AcpClient keeps accepted prompts alive when the readiness observer throws", async () => {
+  const writeEntered = createDeferred<AnyMessage>();
+  const agentToClient = new TransformStream<AnyMessage>();
+  const client = makeClient();
+  connectClientToStream(client, {
+    readable: agentToClient.readable,
+    writable: new WritableStream<AnyMessage>({
+      write(message) {
+        writeEntered.resolve(message);
+      },
+    }),
+  });
+
+  const prompt = client.prompt("session-observer-failed", "hello", () => {
+    throw new Error("observer failed");
+  });
+  const request = await writeEntered.promise;
+  await writeAgentMessage(agentToClient.writable, promptResponseFor(request));
+
+  assert.deepEqual(await prompt, { stopReason: "end_turn" });
+});
+
+test("AcpClient keeps a queued prompt unready until its own transport write succeeds", async () => {
+  const firstWriteEntered = createDeferred<AnyMessage>();
+  const secondWriteEntered = createDeferred<AnyMessage>();
+  const releaseFirstWrite = createDeferred<void>();
+  const releaseSecondWrite = createDeferred<void>();
+  const firstRequestWritten = createDeferred<void>();
+  const secondRequestWritten = createDeferred<void>();
+  const agentToClient = new TransformStream<AnyMessage>();
+  const client = makeClient();
+  let writeCount = 0;
+  connectClientToStream(client, {
+    readable: agentToClient.readable,
+    writable: new WritableStream<AnyMessage>({
+      async write(message) {
+        writeCount += 1;
+        if (writeCount === 1) {
+          firstWriteEntered.resolve(message);
+          await releaseFirstWrite.promise;
+          return;
+        }
+        secondWriteEntered.resolve(message);
+        await releaseSecondWrite.promise;
+      },
+    }),
+  });
+
+  let secondReadinessCalls = 0;
+  const firstPrompt = client.prompt("session-queued", "first", () => {
+    firstRequestWritten.resolve();
+  });
+  const secondPrompt = client.prompt("session-queued", "second", () => {
+    secondReadinessCalls += 1;
+    secondRequestWritten.resolve();
+  });
+
+  const firstRequest = await firstWriteEntered.promise;
+  assert.equal(writeCount, 1);
+  assert.equal(secondReadinessCalls, 0);
+
+  releaseFirstWrite.resolve();
+  await firstRequestWritten.promise;
+  const secondRequest = await secondWriteEntered.promise;
+  assert.equal(secondReadinessCalls, 0);
+
+  await writeAgentMessage(agentToClient.writable, promptResponseFor(firstRequest));
+  releaseSecondWrite.resolve();
+  await secondRequestWritten.promise;
+  assert.equal(secondReadinessCalls, 1);
+  await writeAgentMessage(agentToClient.writable, promptResponseFor(secondRequest));
+
+  assert.deepEqual(await firstPrompt, { stopReason: "end_turn" });
+  assert.deepEqual(await secondPrompt, { stopReason: "end_turn" });
+});
+
 test("AcpClient rejects rich prompt content not advertised by promptCapabilities", async () => {
   const client = makeClient();
   const internals = asInternals(client);
@@ -1259,38 +1888,31 @@ test("AcpClient sends audio prompts when the agent advertises audio support", as
   assert.deepEqual(capturedPrompt, [{ type: "audio", mimeType: "audio/wav", data: "UklGRg==" }]);
 });
 
-test("AcpClient reports prompt start only after the connection request exists", async () => {
+test("AcpClient does not infer prompt readiness from connection promise creation", async () => {
   const client = makeClient();
   const internals = asInternals(client);
-  const calls: string[] = [];
   let resolvePrompt!: (value: { stopReason: "end_turn" }) => void;
   const promptResponse = new Promise<{ stopReason: "end_turn" }>((resolve) => {
     resolvePrompt = resolve;
   });
-  let reportStarted!: () => void;
-  const started = new Promise<void>((resolve) => {
-    reportStarted = resolve;
-  });
+  let reported = false;
   internals.connection = {
-    prompt: () => {
-      calls.push("prompt");
-      return promptResponse;
-    },
+    prompt: () => promptResponse,
   };
 
   const pending = client.prompt("session-start", "hello", () => {
-    calls.push("started");
-    reportStarted();
+    reported = true;
   });
-  await started;
+  await Promise.resolve();
 
-  assert.deepEqual(calls, ["prompt", "started"]);
+  assert.equal(reported, false);
   assert.equal(client.hasActivePrompt(), true);
   resolvePrompt({ stopReason: "end_turn" });
   assert.deepEqual(await pending, { stopReason: "end_turn" });
+  assert.equal(reported, false);
 });
 
-test("AcpClient does not report prompt start when request creation throws", async () => {
+test("AcpClient does not report prompt readiness when request creation throws", async () => {
   const client = makeClient();
   const internals = asInternals(client);
   let reported = false;
@@ -1310,7 +1932,7 @@ test("AcpClient does not report prompt start when request creation throws", asyn
   assert.equal(reported, false);
 });
 
-test("AcpClient does not report prompt start when the connection is already closed", async () => {
+test("AcpClient does not report prompt readiness when the connection is already closed", async () => {
   const client = makeClient();
   const internals = asInternals(client);
   let reported = false;
@@ -1353,7 +1975,7 @@ test("AcpClient does not submit a prompt after agent exit settles the queued req
   assert.equal(reported, false);
 });
 
-test("AcpClient reports prompt start when the connection closes while creating the request", async () => {
+test("AcpClient does not report prompt readiness when the connection closes during request creation", async () => {
   const client = makeClient();
   const internals = asInternals(client);
   const connection = new AbortController();
@@ -1370,24 +1992,7 @@ test("AcpClient reports prompt start when the connection closes while creating t
     reported = true;
   });
 
-  assert.equal(reported, true);
-});
-
-test("AcpClient prompt completion does not depend on prompt start observers", async () => {
-  const client = makeClient();
-  const internals = asInternals(client);
-  internals.connection = {
-    prompt: async () => ({ stopReason: "end_turn" }),
-  };
-
-  await assert.doesNotReject(
-    client.prompt("session-start-observer-failure", "hello", async () => {
-      throw new Error("observer failed");
-    }),
-  );
-  await assert.doesNotReject(
-    client.prompt("session-start-observer-pending", "hello", () => new Promise<void>(() => {})),
-  );
+  assert.equal(reported, false);
 });
 
 test("AcpClient prompt rejects when the agent disconnects mid-prompt", async () => {
@@ -1415,6 +2020,303 @@ test("AcpClient prompt rejects when the agent disconnects mid-prompt", async () 
   assert(result.error instanceof AgentDisconnectedError);
   assert.match(result.error.message, /disconnected during request/i);
   assert.equal(client.hasActivePrompt(), false);
+});
+
+test("AcpClient reports ordered process lifecycle events to embedding hosts", async () => {
+  const observed: string[] = [];
+  let launchId: string | undefined;
+  let pid: number | undefined;
+  let resolveExit: (() => void) | undefined;
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
+  const client = makeClient({
+    agentCommand: process.execPath,
+    agentArgv: [process.execPath, path.join(process.cwd(), "dist-test", "test", "mock-agent.js")],
+    processLaunchScope: { kind: "runtime-session", sessionKey: "lease-session" },
+    processLifecycle: {
+      onBeforeSpawn: (launch) => {
+        observed.push("before");
+        launchId = launch.launchId;
+        assert.equal(Object.isFrozen(launch), true);
+        assert.equal(Object.isFrozen(launch.args), true);
+        assert.deepEqual(launch.scope, {
+          kind: "runtime-session",
+          sessionKey: "lease-session",
+        });
+        assert.equal(launch.cwd, process.cwd());
+        assert(launch.command.length > 0);
+      },
+      onSpawned: (started) => {
+        observed.push("spawned");
+        assert.equal(started.launchId, launchId);
+        assert.equal(Object.isFrozen(started), true);
+        assert(Number.isInteger(started.pid));
+        assert(started.startedAt.length > 0);
+        pid = started.pid;
+      },
+      onSpawnFailed: () => {
+        assert.fail("spawn should succeed");
+      },
+      onExit: (exit) => {
+        observed.push("exit");
+        assert.equal(exit.launchId, launchId);
+        assert.equal(exit.pid, pid);
+        assert(exit.exitedAt.length > 0);
+        resolveExit?.();
+      },
+    },
+  });
+
+  await client.start();
+  await client.close();
+  await exited;
+
+  assert.deepEqual(observed, ["before", "spawned", "exit"]);
+});
+
+test("AcpClient aborts before spawn when lifecycle admission fails", async () => {
+  const admissionError = new Error("lease persistence failed");
+  let spawned = false;
+  const client = makeClient({
+    agentCommand: process.execPath,
+    agentArgv: [process.execPath, path.join(process.cwd(), "dist-test", "test", "mock-agent.js")],
+    processLifecycle: {
+      onBeforeSpawn: async () => {
+        throw admissionError;
+      },
+      onSpawned: () => {
+        spawned = true;
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => client.start(),
+    (error: unknown) => {
+      assert.equal(error, admissionError);
+      return true;
+    },
+  );
+  assert.equal(spawned, false);
+});
+
+test("AcpClient correlates spawn failures with the prepared launch", async () => {
+  let launchId: string | undefined;
+  let failureLaunchId: string | undefined;
+  let observedFailure: unknown;
+  let exited = false;
+  const client = makeClient({
+    agentCommand: "acpx-test-missing-agent",
+    agentArgv: ["acpx-test-missing-agent"],
+    processLifecycle: {
+      onBeforeSpawn: (launch) => {
+        launchId = launch.launchId;
+      },
+      onSpawnFailed: (failure) => {
+        failureLaunchId = failure.launchId;
+        observedFailure = failure.error;
+        assert(failure.failedAt.length > 0);
+      },
+      onExit: () => {
+        exited = true;
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => client.start(),
+    (error: unknown) => {
+      assert(error instanceof AgentSpawnError);
+      assert.equal(error, observedFailure);
+      return true;
+    },
+  );
+  assert.equal(failureLaunchId, launchId);
+  assert.equal(exited, false);
+});
+
+test("AcpClient does not await non-settling spawn failure observers", async () => {
+  let observerCalled = false;
+  const client = makeClient({
+    agentCommand: "acpx-test-missing-agent",
+    agentArgv: ["acpx-test-missing-agent"],
+    processLifecycle: {
+      onSpawnFailed: () => {
+        observerCalled = true;
+        return new Promise<void>(() => {});
+      },
+    },
+  });
+
+  const result = await Promise.race([
+    client.start().then(
+      () => ({ type: "resolved" as const }),
+      (error: unknown) => ({ type: "rejected" as const, error }),
+    ),
+    new Promise<{ type: "timeout" }>((resolve) => {
+      setTimeout(() => resolve({ type: "timeout" }), 100);
+    }),
+  ]);
+
+  assert.equal(observerCalled, true);
+  assert.equal(result.type, "rejected");
+  assert(result.error instanceof AgentSpawnError);
+});
+
+test("AcpClient terminates a spawned process when spawned admission fails", async () => {
+  const admissionError = new Error("spawned lease persistence failed");
+  let spawnedPid: number | undefined;
+  let exitedPid: number | undefined;
+  let resolveExit: (() => void) | undefined;
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
+  const client = makeClient({
+    agentCommand: process.execPath,
+    agentArgv: [process.execPath, path.join(process.cwd(), "dist-test", "test", "mock-agent.js")],
+    processLifecycle: {
+      onSpawned: (started) => {
+        spawnedPid = started.pid;
+        throw admissionError;
+      },
+      onExit: (exit) => {
+        exitedPid = exit.pid;
+        resolveExit?.();
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => client.start(),
+    (error: unknown) => {
+      assert.equal(error, admissionError);
+      return true;
+    },
+  );
+  await exited;
+
+  assert.equal(exitedPid, spawnedPid);
+});
+
+test("AcpClient reports an early exit after spawned admission settles", async () => {
+  const admissionError = new Error("spawned lease persistence failed");
+  const observed: string[] = [];
+  let resolveExit: (() => void) | undefined;
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
+  const client = makeClient({
+    agentCommand: process.execPath,
+    agentArgv: [process.execPath, path.join(process.cwd(), "dist-test", "test", "mock-agent.js")],
+    processLifecycle: {
+      onSpawned: async (started) => {
+        observed.push("spawned:start");
+        process.kill(started.pid);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        observed.push("spawned:end");
+        throw admissionError;
+      },
+      onExit: () => {
+        observed.push("exit");
+        resolveExit?.();
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => client.start(),
+    (error: unknown) => {
+      assert.equal(error, admissionError);
+      return true;
+    },
+  );
+  await exited;
+
+  assert.deepEqual(observed, ["spawned:start", "spawned:end", "exit"]);
+});
+
+test("AcpClient rejects when the agent exits during successful spawned admission", async () => {
+  const stderrLine = "exited during spawned admission";
+  const observed: string[] = [];
+  let resolveExit: (() => void) | undefined;
+  const exited = new Promise<void>((resolve) => {
+    resolveExit = resolve;
+  });
+  const client = makeClient({
+    agentCommand: process.execPath,
+    agentArgv: [
+      process.execPath,
+      "--eval",
+      `setTimeout(() => {
+        process.stderr.write(${JSON.stringify(`${stderrLine}\n`)});
+        process.exit(17);
+      }, 20);`,
+    ],
+    processLifecycle: {
+      onSpawned: async () => {
+        observed.push("spawned:start");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        observed.push("spawned:end");
+      },
+      onExit: () => {
+        observed.push("exit");
+        resolveExit?.();
+      },
+    },
+  });
+
+  const result = await Promise.race([
+    client.start().then(
+      () => ({ type: "resolved" as const }),
+      (error: unknown) => ({ type: "rejected" as const, error }),
+    ),
+    new Promise<{ type: "timeout" }>((resolve) => {
+      setTimeout(() => resolve({ type: "timeout" }), 2_000);
+    }),
+  ]);
+
+  assert.equal(result.type, "rejected");
+  assert(result.error instanceof AgentStartupError);
+  assert.equal(result.error.exitCode, 17);
+  assert.equal(result.error.signal, null);
+  assert.match(result.error.message, /exited during spawned admission/);
+  await exited;
+  assert.deepEqual(observed, ["spawned:start", "spawned:end", "exit"]);
+});
+
+test("AcpClient reports an exit recorded before lifecycle observers attach", async () => {
+  const observed: Array<{ exitCode: number | null; signal: NodeJS.Signals | null }> = [];
+  const client = makeClient({
+    processLifecycle: {
+      onExit: ({ exitCode, signal }) => {
+        observed.push({ exitCode, signal });
+      },
+    },
+  });
+  const child = spawn(process.execPath, ["--eval", "process.exit(17)"], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  await new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", () => resolve());
+  });
+  assert.equal(child.exitCode, 17);
+
+  const startedProcess: AcpProcessStarted = Object.freeze({
+    launchId: "already-exited-launch",
+    scope: Object.freeze({ kind: "client" }),
+    command: process.execPath,
+    args: Object.freeze(["--eval", "process.exit(17)"]),
+    cwd: process.cwd(),
+    pid: child.pid!,
+    startedAt: new Date().toISOString(),
+  });
+  const internals = asInternals(client);
+  internals.attachAgentLifecycleObservers?.(child, startedProcess, Promise.resolve());
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(observed, [{ exitCode: 17, signal: null }]);
 });
 
 test("AcpClient start fails fast when the agent exits during initialize", async () => {
@@ -1521,6 +2423,116 @@ function asInternals(client: AcpClient): ClientInternals {
   return client as unknown as ClientInternals;
 }
 
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+};
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function createCancellationFixture(
+  t: TestContext,
+  options: {
+    client?: Partial<ConstructorParameters<typeof AcpClient>[0]>;
+    write?: (message: AnyMessage) => Promise<void> | void;
+    release?: () => void;
+  } = {},
+) {
+  const client = makeClient(options.client);
+  const incoming = new TransformStream<AnyMessage>();
+  const messages: AnyMessage[] = [];
+  const written: Array<Deferred<AnyMessage>> = [];
+  const pending: Array<Promise<unknown>> = [];
+  const message = (index: number) => (written[index] ??= createDeferred<AnyMessage>()).promise;
+  function track<T>(operation: Promise<T>): Promise<T> {
+    pending.push(operation);
+    void operation.catch(() => {});
+    return operation;
+  }
+  connectClientToStream(client, {
+    readable: incoming.readable,
+    writable: new WritableStream<AnyMessage>({
+      async write(value) {
+        const index = messages.push(value) - 1;
+        void message(index);
+        written[index].resolve(value);
+        await options.write?.(value);
+      },
+    }),
+  });
+  t.after(async () => {
+    options.release?.();
+    try {
+      await incoming.writable.close();
+    } finally {
+      await client.close();
+      await Promise.allSettled(pending);
+    }
+  });
+  return {
+    client,
+    messages,
+    message,
+    track,
+    prompt(sessionId: string, text: string) {
+      return track(client.prompt(sessionId, text));
+    },
+    permission(sessionId: string) {
+      const handler = asInternals(client).handlePermissionRequest;
+      assert(handler);
+      return track(handler.call(client, makePermissionRequest(sessionId, "edit")));
+    },
+    reply(request: AnyMessage) {
+      return writeAgentMessage(incoming.writable, promptResponseFor(request));
+    },
+  };
+}
+
+function connectClientToStream(
+  client: AcpClient,
+  base: {
+    readable: ReadableStream<AnyMessage>;
+    writable: WritableStream<AnyMessage>;
+  },
+): void {
+  const internals = asInternals(client);
+  const tapped = internals.createTappedStream?.(base);
+  assert(tapped);
+  const connection = internals.createConnection?.(tapped, { devinAcp: false });
+  assert(connection);
+  internals.connection = connection;
+}
+
+function promptResponseFor(request: AnyMessage): AnyMessage {
+  assert("id" in request);
+  return {
+    jsonrpc: "2.0",
+    id: request.id,
+    result: { stopReason: "end_turn" },
+  };
+}
+
+async function writeAgentMessage(
+  writable: WritableStream<AnyMessage>,
+  message: AnyMessage,
+): Promise<void> {
+  const writer = writable.getWriter();
+  try {
+    await writer.write(message);
+  } finally {
+    writer.releaseLock();
+  }
+}
+
 function makePermissionRequest(
   sessionId: string,
   kind: RequestPermissionRequest["toolCall"]["kind"],
@@ -1610,3 +2622,20 @@ function restoreDescriptor(
     delete (target as Record<string, unknown>)[key];
   }
 }
+
+test("host permission decisions release their abort listeners after settlement", async () => {
+  let signal: AbortSignal | undefined;
+  const client = makeClient({
+    onPermissionRequest: async (_request, context) => {
+      signal = context.signal;
+      return { outcome: "allow_once" };
+    },
+  });
+  for (let index = 0; index < 3; index++) {
+    await asInternals(client).handlePermissionRequest?.(
+      makePermissionRequest("idle-permissions", "edit"),
+    );
+  }
+  assert.ok(signal);
+  assert.equal(getEventListeners(signal, "abort").length, 0);
+});

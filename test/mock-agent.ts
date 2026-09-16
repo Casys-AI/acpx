@@ -25,6 +25,7 @@ import {
   type ListSessionsResponse,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type NewSessionRequest,
   type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
@@ -32,6 +33,7 @@ import {
   type ResumeSessionRequest,
   type ResumeSessionResponse,
   type SessionId,
+  type SessionConfigOption,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
@@ -68,6 +70,7 @@ type MockAgentOptions = {
   setSessionModelInvalidParams: boolean;
   advertiseConfigOptions: boolean;
   advertiseModels: boolean;
+  advertiseModelProvider: boolean;
   advertiseLegacyModels: boolean;
   advertiseCommandsAfterNew: boolean;
   modelConfigId: string;
@@ -98,6 +101,7 @@ type SessionState = {
   transientPromptAttempts: Record<string, number>;
   modelId: string;
   lastElicitationResponse?: CreateElicitationResponse;
+  mcpServers?: NewSessionRequest["mcpServers"];
 };
 
 class CancelledError extends Error {
@@ -398,6 +402,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
   let setSessionModelInvalidParams = false;
   let advertiseConfigOptions = false;
   let advertiseModels = false;
+  let advertiseModelProvider = false;
   let advertiseLegacyModels = false;
   let advertiseCommandsAfterNew = false;
   let modelConfigId = "model";
@@ -477,6 +482,12 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
 
     if (token === "--advertise-models") {
       advertiseModels = true;
+      continue;
+    }
+
+    if (token === "--advertise-model-provider") {
+      advertiseModels = true;
+      advertiseModelProvider = true;
       continue;
     }
 
@@ -660,6 +671,7 @@ function parseMockAgentOptions(argv: string[]): MockAgentOptions {
     setSessionModelInvalidParams,
     advertiseConfigOptions,
     advertiseModels,
+    advertiseModelProvider,
     advertiseLegacyModels,
     advertiseCommandsAfterNew,
     modelConfigId,
@@ -764,6 +776,7 @@ function buildConfigOptions(
   modelConfigId: string,
   omitModelId?: string,
   currentModelId = state.modelId,
+  includeProvider = false,
 ): SetSessionConfigOptionResponse["configOptions"] {
   const reasoningEffort =
     typeof state.configValues.reasoning_effort === "string"
@@ -779,6 +792,18 @@ function buildConfigOptions(
   ].filter((option) => option.value !== omitModelId);
 
   return [
+    ...(includeProvider
+      ? [
+          {
+            id: "provider",
+            name: "Provider",
+            type: "select",
+            category: "model",
+            currentValue: "fixture-provider",
+            options: [{ value: "fixture-provider", name: "Fixture Provider" }],
+          } satisfies SessionConfigOption,
+        ]
+      : []),
     {
       id: "mode",
       name: "Session Mode",
@@ -858,13 +883,13 @@ class MockAgent implements Agent {
     return;
   }
 
-  async newSession(): Promise<NewSessionResponse> {
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
     if (this.options.hangOnNewSession) {
       return await new Promise<NewSessionResponse>(() => {});
     }
 
     const sessionId = randomUUID();
-    this.sessions.set(sessionId, createSessionState(false));
+    this.sessions.set(sessionId, { ...createSessionState(false), mcpServers: params.mcpServers });
 
     if (this.options.elicitOnNewSession) {
       const response = await this.connection.request(methods.client.elicitation.create, {
@@ -887,6 +912,8 @@ class MockAgent implements Agent {
         this.sessions.get(sessionId) ?? createSessionState(false),
         this.options.modelConfigId,
         this.options.omitReconnectModelId,
+        undefined,
+        this.options.advertiseModelProvider,
       );
     }
 
@@ -927,7 +954,10 @@ class MockAgent implements Agent {
       throw error;
     }
 
-    this.sessions.set(params.sessionId, existing ?? createSessionState(false));
+    this.sessions.set(params.sessionId, {
+      ...(existing ?? createSessionState(false)),
+      mcpServers: params.mcpServers,
+    });
 
     if (this.options.replayLoadSessionUpdates) {
       await this.sendAssistantMessage(params.sessionId, this.options.loadReplayText);
@@ -968,6 +998,9 @@ class MockAgent implements Agent {
       response.configOptions = buildConfigOptions(
         this.sessions.get(sessionId) ?? createSessionState(false),
         this.options.modelConfigId,
+        undefined,
+        undefined,
+        this.options.advertiseModelProvider,
       );
     }
 
@@ -1162,6 +1195,7 @@ class MockAgent implements Agent {
         this.options.modelConfigId,
         this.options.omitReconnectModelId,
         this.options.reportModelAs,
+        this.options.advertiseModelProvider,
       ),
     };
   }
@@ -1293,6 +1327,10 @@ class MockAgent implements Agent {
     }
     if (text === "retryable-error-once") {
       return "recovered after retry";
+    }
+
+    if (text === "session-mcp-servers") {
+      return JSON.stringify(this.ensureSession(sessionId).mcpServers);
     }
 
     if (text === "client-capabilities") {
@@ -1541,7 +1579,7 @@ class MockAgent implements Agent {
     signal: AbortSignal,
   ): Promise<string> {
     if (command === "complete") {
-      await this.connection.unstable_completeElicitation({
+      await this.connection.completeElicitation({
         elicitationId: "elicitation-123",
       });
       return "elicitation complete accepted";

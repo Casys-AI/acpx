@@ -4,6 +4,7 @@ import path from "node:path";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { AcpxOperationalError } from "../errors.js";
 import { isProcessAlive } from "../process-liveness.js";
+import { writePrivateFile } from "../state-files.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import {
   sessionEventActivePath,
@@ -138,14 +139,13 @@ async function isSessionActive(record: SessionRecord): Promise<boolean> {
   return isProcessAlive(record.pid) || (await hasLiveEventLock(record.acpxRecordId));
 }
 
-async function readHistoryFile(filePath: string): Promise<AcpJsonRpcMessage[]> {
+async function appendHistoryFile(filePath: string, history: AcpJsonRpcMessage[]): Promise<void> {
   const payload = await fs.readFile(filePath, "utf8").catch((error) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return "";
     }
     throw error;
   });
-  const history: AcpJsonRpcMessage[] = [];
   for (const line of payload.split("\n").filter((entry) => entry.trim().length > 0)) {
     try {
       const parsed: unknown = JSON.parse(line);
@@ -156,7 +156,6 @@ async function readHistoryFile(filePath: string): Promise<AcpJsonRpcMessage[]> {
       // Match event listing resilience: tolerate truncated NDJSON writes.
     }
   }
-  return history;
 }
 
 async function readSessionHistory(record: SessionRecord): Promise<AcpJsonRpcMessage[]> {
@@ -166,10 +165,10 @@ async function readSessionHistory(record: SessionRecord): Promise<AcpJsonRpcMess
     : 0;
 
   for (let segment = maxSegments; segment >= 1; segment -= 1) {
-    history.push(...(await readHistoryFile(sessionEventSegmentPath(record.acpxRecordId, segment))));
+    await appendHistoryFile(sessionEventSegmentPath(record.acpxRecordId, segment), history);
   }
 
-  history.push(...(await readHistoryFile(sessionEventActivePath(record.acpxRecordId))));
+  await appendHistoryFile(sessionEventActivePath(record.acpxRecordId), history);
   return history;
 }
 
@@ -237,8 +236,32 @@ export async function exportSession(
     history: await readSessionHistory(record),
   };
 
-  await fs.mkdir(path.dirname(path.resolve(outputPath)), { recursive: true });
-  await fs.writeFile(outputPath, `${JSON.stringify(exported, null, 2)}\n`, "utf8");
+  const target = await resolveExportTarget(outputPath);
+  await writePrivateFile(target, `${JSON.stringify(exported, null, 2)}\n`, {
+    privateDirectory: false,
+  });
+}
+
+async function resolveExportTarget(filePath: string): Promise<string> {
+  for (let hops = 0; hops < 40; hops += 1) {
+    const stat = await fs.lstat(filePath).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") {
+        return undefined;
+      }
+      throw error;
+    });
+    if (!stat || stat.isFile()) {
+      return filePath;
+    }
+    if (!stat.isSymbolicLink()) {
+      throw new Error("Session export output must be a regular file");
+    }
+    const target = await fs.readlink(filePath);
+    // Keep raw segments so native parent resolution preserves symlink/.. and
+    // Windows junctions across volumes, including dangling final symlinks.
+    filePath = path.isAbsolute(target) ? target : `${path.dirname(filePath)}${path.sep}${target}`;
+  }
+  throw new Error("Too many symbolic links in session export output");
 }
 
 function normalizeAgentName(agentName: string | undefined): string | undefined {

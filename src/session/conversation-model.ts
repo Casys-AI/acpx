@@ -26,12 +26,6 @@ import type {
 } from "../types.js";
 import { applyConfigOptionsModelState } from "./model-state.js";
 
-export type LegacyHistoryEntry = {
-  role: "user" | "assistant";
-  timestamp: string;
-  textPreview: string;
-};
-
 const MAX_RUNTIME_MESSAGES = 200;
 const MAX_RUNTIME_AGENT_TEXT_CHARS = 8_000;
 const MAX_RUNTIME_THINKING_CHARS = 4_000;
@@ -603,40 +597,11 @@ function cloneSystemPromptOption(
   return typeof option === "string" ? option : { append: option.append };
 }
 
-export function appendLegacyHistory(
-  conversation: SessionConversation,
-  entries: LegacyHistoryEntry[],
-): void {
-  for (const entry of entries) {
-    const text = entry.textPreview?.trim();
-    if (!text) {
-      continue;
-    }
-
-    if (entry.role === "user") {
-      conversation.messages.push({
-        User: {
-          id: nextUserMessageId(),
-          content: [{ Text: text }],
-        },
-      });
-    } else {
-      conversation.messages.push({
-        Agent: {
-          content: [{ Text: text }],
-          tool_results: {},
-        },
-      });
-    }
-
-    updateConversationTimestamp(conversation, entry.timestamp || conversation.updated_at);
-  }
-}
-
 export function recordPromptSubmission(
   conversation: SessionConversation,
   prompt: PromptInput | string,
   timestamp = isoNow(),
+  messageId?: string,
 ): string | undefined {
   const normalizedPrompt = typeof prompt === "string" ? textPrompt(prompt) : prompt;
   const userContent = normalizedPrompt
@@ -646,7 +611,7 @@ export function recordPromptSubmission(
     return undefined;
   }
 
-  const promptMessageId = nextUserMessageId();
+  const promptMessageId = messageId ?? nextUserMessageId();
   conversation.messages.push({
     User: {
       id: promptMessageId,
@@ -696,11 +661,12 @@ export function recordSessionUpdate(
   state: SessionAcpxState | undefined,
   notification: SessionNotification,
   timestamp = isoNow(),
+  userMessageId?: string,
 ): SessionAcpxState {
   const acpx = ensureAcpxState(state);
 
   const update: SessionUpdate = notification.update;
-  applySessionUpdate(conversation, acpx, update);
+  applySessionUpdate(conversation, acpx, update, userMessageId);
 
   updateConversationTimestamp(conversation, timestamp);
   trimConversationForRuntime(conversation);
@@ -728,21 +694,23 @@ function applySessionUpdate(
   conversation: SessionConversation,
   acpx: SessionAcpxState,
   update: SessionUpdate,
+  userMessageId?: string,
 ): void {
   const handler = SESSION_UPDATE_HANDLERS[update.sessionUpdate];
-  handler?.(conversation, acpx, update);
+  handler?.(conversation, acpx, update, userMessageId);
 }
 
 type SessionUpdateHandler = (
   conversation: SessionConversation,
   acpx: SessionAcpxState,
   update: SessionUpdate,
+  userMessageId?: string,
 ) => void;
 
 const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
-  user_message_chunk: (conversation, _acpx, update) => {
+  user_message_chunk: (conversation, _acpx, update, userMessageId) => {
     if (update.sessionUpdate === "user_message_chunk") {
-      appendUserMessageChunk(conversation, update.content);
+      appendUserMessageChunk(conversation, update.content, userMessageId);
     }
   },
   agent_message_chunk: (conversation, _acpx, update) => {
@@ -795,14 +763,18 @@ const SESSION_UPDATE_HANDLERS: Record<string, SessionUpdateHandler> = {
   },
 };
 
-function appendUserMessageChunk(conversation: SessionConversation, content: ContentBlock): void {
+function appendUserMessageChunk(
+  conversation: SessionConversation,
+  content: ContentBlock,
+  messageId?: string,
+): void {
   const userContent = contentToUserContent(content);
   if (!userContent) {
     return;
   }
   conversation.messages.push({
     User: {
-      id: nextUserMessageId(),
+      id: messageId ?? nextUserMessageId(),
       content: [userContent],
     },
   });
@@ -860,7 +832,7 @@ function applySessionInfoUpdate(
 export function recordClientOperation(
   conversation: SessionConversation,
   state: SessionAcpxState | undefined,
-  operation: ClientOperation,
+  _operation: ClientOperation,
   timestamp = isoNow(),
 ): SessionAcpxState {
   const acpx = ensureAcpxState(state);

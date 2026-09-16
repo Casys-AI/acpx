@@ -29,6 +29,11 @@ export type AcpPermissionDecision =
   | { outcome: "reject_always" }
   | { outcome: "cancel" };
 
+export type AcpPermissionHandler = (
+  request: AcpPermissionRequest,
+  context: { signal: AbortSignal },
+) => Promise<AcpPermissionDecision | undefined>;
+
 export const ACP_ELICITATION_MODES = ["form", "url"] as const;
 export type AcpElicitationMode = (typeof ACP_ELICITATION_MODES)[number];
 export type AcpElicitationRequest = CreateElicitationRequest;
@@ -231,9 +236,57 @@ export interface OutputFormatter {
   flush(): void;
 }
 
+export type AcpProcessLaunchScope =
+  | Readonly<{ kind: "client" }>
+  | Readonly<{ kind: "runtime-session"; sessionKey: string }>
+  | Readonly<{ kind: "runtime-probe"; agent: string }>;
+
+export type AcpProcessLaunch = Readonly<{
+  launchId: string;
+  scope: AcpProcessLaunchScope;
+  command: string;
+  args: readonly string[];
+  cwd: string;
+}>;
+
+export type AcpProcessStarted = AcpProcessLaunch &
+  Readonly<{
+    pid: number;
+    startedAt: string;
+  }>;
+
+export type AcpProcessSpawnFailure = AcpProcessLaunch &
+  Readonly<{
+    error: unknown;
+    failedAt: string;
+  }>;
+
+export type AcpProcessExit = AcpProcessStarted &
+  Readonly<{
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    exitedAt: string;
+  }>;
+
+/**
+ * Optional process lifecycle seam for embedding hosts that persist their own
+ * launch ownership. Pre-spawn and spawned hooks are admission boundaries:
+ * rejecting either aborts startup, and a process rejected after spawn is
+ * terminated before the error is returned. Failure and exit hooks are
+ * best-effort observations and cannot replace the launch or exit outcome.
+ */
+export type AcpProcessLifecycle = {
+  onBeforeSpawn?: (launch: AcpProcessLaunch) => Promise<void> | void;
+  onSpawned?: (process: AcpProcessStarted) => Promise<void> | void;
+  onSpawnFailed?: (failure: AcpProcessSpawnFailure) => Promise<void> | void;
+  onExit?: (exit: AcpProcessExit) => Promise<void> | void;
+};
+
 export type AcpClientOptions = {
   agentCommand: string;
   agentArgv?: string[];
+  /** Trusted child-only environment overlay; never persisted as session options. */
+  agentProcessEnv?: Record<string, string>;
   cwd: string;
   mcpServers?: McpServer[];
   permissionMode: PermissionMode;
@@ -244,6 +297,8 @@ export type AcpClientOptions = {
   fs?: boolean;
   terminal?: boolean;
   elicitationModes?: readonly AcpElicitationMode[];
+  processLifecycle?: AcpProcessLifecycle;
+  processLaunchScope?: AcpProcessLaunchScope;
   suppressSdkConsoleErrors?: boolean;
   verbose?: boolean;
   sessionOptions?: {
@@ -258,10 +313,7 @@ export type AcpClientOptions = {
   onSessionUpdate?: (notification: SessionNotification) => void;
   onClientOperation?: (operation: ClientOperation) => void;
   onPermissionEscalation?: (event: PermissionEscalationEvent) => void;
-  onPermissionRequest?: (
-    req: AcpPermissionRequest,
-    ctx: { signal: AbortSignal },
-  ) => Promise<AcpPermissionDecision | undefined>;
+  onPermissionRequest?: AcpPermissionHandler;
 };
 
 export const SESSION_RECORD_SCHEMA = "acpx.session.v1" as const;
@@ -451,6 +503,7 @@ export type RunPromptResult = {
   stopReason: StopReason;
   permissionStats: PermissionStats;
   sessionId: string;
+  _meta?: Record<string, unknown> | null;
 };
 
 export type SessionSendResult = RunPromptResult & {

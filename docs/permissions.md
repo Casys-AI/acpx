@@ -47,6 +47,15 @@ the first chance to decide; returning no decision falls back to the configured
 policy and permission mode. The embedded runtime does not currently expose
 structured permission-escalation notifications to the host.
 
+Pass `onPermissionRequest` to `startTurn()` or `runTurn()` to override the runtime
+callback for one prompt. Each turn owns its handler, including when one runtime
+serves concurrent sessions. Returning `undefined` or throwing falls back to the
+configured policy and mode, without calling the runtime callback. Use
+`permissionMode: "deny-all"` when missing host decisions must deny permission.
+The callback's signal aborts when the turn finishes, times out, is cancelled,
+or its connection closes. Pending permission requests then return cancellation;
+a late host response cannot approve the action.
+
 ## What counts as a "read"
 
 Read/search requests in `--approve-reads`:
@@ -93,7 +102,16 @@ If at least one request was approved (auto or explicit), exit code is whatever t
 
 ## Sandboxing with `--cwd`
 
-`--cwd <dir>` sets the working directory the agent operates in. The ACP `fs/*` and `terminal/*` client methods that `acpx` implements honor cwd boundaries — adapters cannot escape that directory through `fs/read_text_file` or terminal calls routed through the client.
+`--cwd <dir>` sets the working directory the agent operates in. ACP `fs/*`
+methods resolve paths through an fs-safe root: ordinary files and contained
+symlinks work, while symlinks outside cwd and special files such as FIFOs are
+rejected. Writes preserve existing file modes and truncate through an admitted
+descriptor; writes to hardlinked files are rejected to avoid modifying aliases.
+Reads retain their existing size behavior.
+
+These filesystem checks are best-effort guardrails within acpx's trusted-user
+model, not an OS sandbox. They do not isolate a hostile same-user process or
+confine arbitrary shell commands launched through terminal capabilities.
 
 ```bash
 acpx --cwd ~/repos/api --approve-all codex 'fix everything you find'

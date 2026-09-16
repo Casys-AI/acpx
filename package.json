@@ -1,6 +1,6 @@
 {
   "name": "acpx",
-  "version": "0.13.1",
+  "version": "0.16.0",
   "description": "Headless CLI client for the Agent Client Protocol (ACP) — talk to coding agents from the command line",
   "keywords": [
     "acp",
@@ -54,10 +54,10 @@
     "format": "oxfmt --write",
     "format:check": "oxfmt --check",
     "format:diff": "oxfmt --write && git --no-pager diff",
-    "format:docs": "git ls-files 'docs/**/*.md' 'examples/flows/**/*.md' 'README.md' | xargs oxfmt --write",
-    "format:docs:check": "git ls-files 'docs/**/*.md' 'examples/flows/**/*.md' 'README.md' | xargs oxfmt --check",
+    "format:docs": "git ls-files -z 'docs/*.md' 'examples/flows/*.md' 'README.md' | xargs -0 oxfmt --write",
+    "format:docs:check": "git ls-files -z 'docs/*.md' 'examples/flows/*.md' 'README.md' | xargs -0 oxfmt --check",
     "lint": "oxlint --type-aware --deny-warnings src scripts examples test conformance && pnpm run lint:persisted-key-casing && pnpm run lint:flow-schema-terms",
-    "lint:docs": "markdownlint-cli2 README.md docs/**/*.md examples/flows/**/*.md",
+    "lint:docs": "markdownlint-cli2 README.md \"docs/**/*.md\" \"examples/flows/**/*.md\"",
     "lint:fix": "oxlint --type-aware --fix src && pnpm run format",
     "lint:flow-schema-terms": "tsx scripts/lint-flow-schema-terms.ts",
     "lint:persisted-key-casing": "tsx scripts/lint-persisted-key-casing.ts",
@@ -66,9 +66,9 @@
     "precommit": "pnpm exec lint-staged && pnpm run -s build",
     "prepack": "tsdown --logLevel silent src/cli.ts src/flows.ts src/runtime.ts --format esm --dts --clean --platform node --target node22 --no-fixedExtension && pnpm run build:native",
     "prepare": "husky",
-    "test": "pnpm run build && pnpm run build:test && node --test dist-test/test/*.test.js",
+    "test": "pnpm run build && pnpm run build:test && node --test --test-concurrency=4 dist-test/test/*.test.js",
     "test:changed": "pnpm run test:coverage",
-    "test:coverage": "pnpm run build && pnpm run build:test && node --test dist-test/test/*.test.js && c8 --all --check-coverage --lines 85 --branches 85 --functions 85 --statements 85 --include 'dist-test/src/flows/authoring.js' --include 'dist-test/src/flows/decision.js' --include 'dist-test/src/flows/definition.js' --include 'dist-test/src/flows/json.js' --include 'dist-test/src/flows/schema.js' --include 'dist-test/src/flows/store.js' --include 'dist-test/src/runtime/public/**/*.js' --include 'dist-test/src/runtime/engine/manager.js' --exclude 'dist-test/test/**/*.js' --exclude 'dist/**/*.js' node --test dist-test/test/flows.test.js dist-test/test/flows-store.test.js dist-test/test/runtime.test.js dist-test/test/runtime-events.test.js dist-test/test/runtime-manager.test.js dist-test/test/runtime-probe.test.js",
+    "test:coverage": "pnpm run build && pnpm run build:test && node --test --test-concurrency=4 dist-test/test/*.test.js && c8 --all --check-coverage --lines 85 --branches 85 --functions 85 --statements 85 --include 'dist-test/src/flows/authoring.js' --include 'dist-test/src/flows/decision.js' --include 'dist-test/src/flows/definition.js' --include 'dist-test/src/flows/json.js' --include 'dist-test/src/flows/schema.js' --include 'dist-test/src/flows/store.js' --include 'dist-test/src/runtime/public/**/*.js' --include 'dist-test/src/runtime/engine/manager.js' --include 'dist-test/src/runtime/engine/status.js' --exclude 'dist-test/test/**/*.js' --exclude 'dist/**/*.js' node --test dist-test/test/flows.test.js dist-test/test/flows-store.test.js dist-test/test/runtime.test.js dist-test/test/runtime-events.test.js dist-test/test/runtime-manager.test.js dist-test/test/runtime-probe.test.js",
     "test:live": "pnpm run build:test && node --test dist-test/test/cursor-live.integration.js",
     "typecheck": "tsc --noEmit",
     "typecheck:tsc": "tsc --noEmit",
@@ -82,38 +82,39 @@
     "viewer:typecheck": "tsc -p examples/flows/replay-viewer/tsconfig.json --noEmit && tsc -p examples/flows/replay-viewer/tsconfig.server.json --noEmit"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "^1.3.0",
+    "@agentclientprotocol/sdk": "^1.4.0",
+    "@openclaw/fs-safe": "^0.10.0",
     "commander": "^15.0.0",
     "skillflag": "^0.2.1",
-    "tsx": "^4.23.1",
-    "zod": "^4.4.3"
+    "tsx": "^4.23.13",
+    "zod": "^4.6.2"
   },
   "devDependencies": {
-    "@stryker-mutator/core": "^9.6.1",
-    "@types/node": "^26.1.1",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@types/react-test-renderer": "^19.1.0",
+    "@stryker-mutator/core": "^10.0.0",
+    "@types/node": "^26.5.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/react-test-renderer": "^19.3.0",
     "@types/ws": "^8.18.1",
     "@typescript/native": "npm:typescript@^7.0.2",
-    "@vitejs/plugin-react": "^6.0.4",
-    "@xyflow/react": "^12.11.2",
+    "@vitejs/plugin-react": "^6.1.1",
+    "@xyflow/react": "^12.11.6",
     "c8": "^12.0.0",
     "elkjs": "^0.12.0",
     "fast-json-patch": "^3.1.1",
     "husky": "^9.1.7",
-    "lint-staged": "^17.2.0",
-    "markdownlint-cli2": "^0.23.1",
-    "oxfmt": "^0.63.0",
-    "oxlint": "^1.75.0",
+    "lint-staged": "^17.5.1",
+    "markdownlint-cli2": "^0.23.2",
+    "oxfmt": "^0.67.0",
+    "oxlint": "^1.82.0",
     "oxlint-tsgolint": "^7.0.2001",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "react-test-renderer": "^19.2.8",
-    "tsdown": "^0.22.14",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-test-renderer": "^19.3.0",
+    "tsdown": "^0.23.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
-    "vite": "^8.1.5",
-    "ws": "^8.21.1"
+    "vite": "^8.3.0",
+    "ws": "^8.21.3"
   },
   "lint-staged": {
     "*.{js,ts}": [
@@ -127,5 +128,5 @@
   "engines": {
     "node": ">=22.13.0"
   },
-  "packageManager": "pnpm@10.34.5"
+  "packageManager": "pnpm@11.26.0"
 }

@@ -36,6 +36,12 @@ What happens:
 - Run state (graph, ACP transcripts, artifacts, errors) is persisted as the run progresses.
 - The runtime exits when the graph terminates or a checkpoint pauses.
 
+On POSIX systems, run snapshots, projections, artifacts, and event logs use
+owner-only file permissions (`0600`); acpx-owned run directories use `0700`.
+Existing custom output-root directories keep their permissions. Snapshot writes
+publish complete files atomically and clean up failed staging writes. Event logs
+remain append-only and retain their existing ordering and size behavior.
+
 `--input-json` and `--input-file` are mutually exclusive ways to provide flow input. `--default-agent` supplies the default agent profile for `acp` nodes that do not pin one.
 
 ## Node types
@@ -136,6 +142,12 @@ Bundles are immutable once a run terminates. They are the input for the [replay 
 
 `acp` and `action` nodes use the global `--timeout` value as their default per-step timeout. If `--timeout` is not set, flows default to **15 minutes per active step**. Override per step in the flow definition when needed.
 
+A shell action's `timeoutMs: 0` disables its own deadline; an enclosing node deadline still applies. On expiry or interruption, acpx cancels active shell commands and waits for termination and output-stream cleanup before reporting cancellation. Cleanup failures are reported instead of silently claiming cleanup succeeded. An executor that resolves after its node has timed out or been interrupted cannot launch a new shell process.
+
+Set `maxBufferBytes` on the object returned by `shell().exec` to limit captured stdout and stderr independently. The value is a non-negative safe integer counting UTF-8 bytes; omission preserves unlimited capture, and zero permits empty output only. Overflow fails the action even with `allowNonZeroExit`, stops retaining output, and waits for the existing process-tree cleanup before returning the error. A timeout or cancellation already in progress keeps its original result.
+
+On POSIX, cleanup covers the owned process group and descendants discoverable before it is signalled, including descendants that move to another process group while their wrapper is active. Successful command completion still follows the wrapper's exit. A child that deliberately starts a separate session with independent stdio and is reparented before cancellation can outlive the flow, as before; acpx does not provide persistent supervision of escaped daemons.
+
 ## Replay viewer
 
 `examples/flows/replay-viewer/` is a browser app that visualizes saved run bundles:
@@ -152,6 +164,10 @@ pnpm viewer
 ```
 
 The viewer is read-only. It opens a saved bundle and lets you inspect what happened; it does not re-run the flow.
+
+Malformed HTTP or WebSocket input is rejected without stopping the viewer.
+Corrupt bundle metadata is skipped, and transient read failures do not prevent
+subsequent live updates.
 
 ## Example flows in the source tree
 

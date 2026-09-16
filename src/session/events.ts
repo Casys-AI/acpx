@@ -1,23 +1,19 @@
 import fs from "node:fs/promises";
+import { appendRegularFile } from "@openclaw/fs-safe/advanced";
 import { isAcpJsonRpcMessage } from "../acp/jsonrpc.js";
 import { incrementPerfCounter, measurePerf } from "../perf-metrics.js";
-import { isProcessAlive } from "../process-liveness.js";
 import type { AcpJsonRpcMessage, SessionRecord } from "../types.js";
 import {
   DEFAULT_EVENT_MAX_SEGMENTS,
   DEFAULT_EVENT_SEGMENT_MAX_BYTES,
   sessionBaseDir,
   sessionEventActivePath as activeEventPath,
-  sessionEventLockPath as eventsLockPath,
   sessionEventSegmentPath as segmentEventPath,
 } from "./event-log.js";
 import { resolveSessionRecord, writeSessionRecord } from "./persistence.js";
 
-const LOCK_RETRY_MS = 15;
-const EVENT_LOCK_STALE_MS = 15_000;
-
 async function ensureSessionDir(): Promise<void> {
-  await fs.mkdir(sessionBaseDir(), { recursive: true });
+  await fs.mkdir(sessionBaseDir(), { recursive: true, mode: 0o700 });
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -102,97 +98,6 @@ async function rotateSegments(sessionId: string, maxSegments: number): Promise<v
   }
 }
 
-type LockHandle = {
-  filePath: string;
-};
-
-type EventLockPayload = {
-  pid?: number;
-  created_at?: string;
-};
-
-function parseEventLockPayload(raw: string): EventLockPayload {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-    const record = parsed as Record<string, unknown>;
-    return {
-      pid: typeof record.pid === "number" ? record.pid : undefined,
-      created_at: typeof record.created_at === "string" ? record.created_at : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-async function removeStaleEventLock(lockPath: string): Promise<boolean> {
-  try {
-    const payload = await fs.readFile(lockPath, "utf8");
-    const parsed = parseEventLockPayload(payload);
-    const createdAtMs = parsed.created_at ? Date.parse(parsed.created_at) : Number.NaN;
-    const lockAgeMs = Number.isFinite(createdAtMs)
-      ? Date.now() - createdAtMs
-      : Number.POSITIVE_INFINITY;
-    const pidAlive = isProcessAlive(parsed.pid);
-    if (pidAlive && lockAgeMs <= EVENT_LOCK_STALE_MS) {
-      return false;
-    }
-    await fs.unlink(lockPath);
-    incrementPerfCounter("session.events.stale_lock_recovered");
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return true;
-    }
-    return false;
-  }
-}
-
-async function acquireEventsLock(sessionId: string): Promise<LockHandle> {
-  await ensureSessionDir();
-  const lockPath = eventsLockPath(sessionId);
-  const payload = JSON.stringify(
-    {
-      pid: process.pid,
-      created_at: new Date().toISOString(),
-    },
-    null,
-    2,
-  );
-
-  for (;;) {
-    try {
-      await fs.writeFile(lockPath, `${payload}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-      });
-      return { filePath: lockPath };
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") {
-        throw error;
-      }
-      const recovered = await removeStaleEventLock(lockPath);
-      if (recovered) {
-        continue;
-      }
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, LOCK_RETRY_MS);
-      });
-    }
-  }
-}
-
-async function releaseEventsLock(lock: LockHandle): Promise<void> {
-  await fs.unlink(lock.filePath).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw error;
-    }
-  });
-}
-
 type SessionEventWriterOptions = {
   maxSegmentBytes?: number;
   maxSegments?: number;
@@ -204,7 +109,6 @@ type AppendOptions = {
 
 export class SessionEventWriter {
   private readonly record: SessionRecord;
-  private readonly lock: LockHandle;
   private readonly maxSegmentBytes: number;
   private readonly maxSegments: number;
   private activePath: string;
@@ -214,7 +118,6 @@ export class SessionEventWriter {
 
   private constructor(
     record: SessionRecord,
-    lock: LockHandle,
     options: Required<SessionEventWriterOptions>,
     state: {
       activePath: string;
@@ -223,7 +126,6 @@ export class SessionEventWriter {
     },
   ) {
     this.record = record;
-    this.lock = lock;
     this.maxSegmentBytes = options.maxSegmentBytes;
     this.maxSegments = options.maxSegments;
     this.activePath = state.activePath;
@@ -235,7 +137,6 @@ export class SessionEventWriter {
     record: SessionRecord,
     options: SessionEventWriterOptions = {},
   ): Promise<SessionEventWriter> {
-    const lock = await acquireEventsLock(record.acpxRecordId);
     const maxSegmentBytes =
       options.maxSegmentBytes ??
       record.eventLog.max_segment_bytes ??
@@ -247,7 +148,6 @@ export class SessionEventWriter {
     const segmentCount = await resolveInitialSegmentCount(record, maxSegments);
     return new SessionEventWriter(
       record,
-      lock,
       {
         maxSegmentBytes,
         maxSegments,
@@ -295,7 +195,7 @@ export class SessionEventWriter {
           incrementPerfCounter("session.events.rotate");
         }
 
-        await fs.appendFile(this.activePath, line, "utf8");
+        await appendRegularFile({ filePath: this.activePath, content: line, mode: 0o600 });
         this.activeSizeBytes += lineBytes;
 
         this.record.lastSeq += 1;
@@ -341,7 +241,6 @@ export class SessionEventWriter {
       }
     } finally {
       this.closed = true;
-      await releaseEventsLock(this.lock);
     }
   }
 }

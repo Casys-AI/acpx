@@ -5,8 +5,7 @@ import { applyConfigOptionsToRecord } from "../../session/config-options.js";
 import { advertisedModelState } from "../../session/model-state.js";
 import { absolutePath, isoNow } from "../../session/persistence.js";
 import type {
-  AcpPermissionDecision,
-  AcpPermissionRequest,
+  AcpPermissionHandler,
   AcpElicitationMode,
   AuthPolicy,
   McpServer,
@@ -17,7 +16,11 @@ import type {
   SessionResumePolicy,
 } from "../../types.js";
 import { applyLifecycleSnapshotToRecord } from "./lifecycle.js";
-import { connectAndLoadSession, type ConnectedSessionController } from "./reconnect.js";
+import {
+  connectAndLoadSession,
+  type ConnectAndLoadSessionOptions,
+  type ConnectedSessionController,
+} from "./reconnect.js";
 import { sessionOptionsFromRecord } from "./session-options.js";
 
 export type FullConnectedSessionController = ConnectedSessionController & {
@@ -46,16 +49,14 @@ export type WithConnectedSessionOptions<T> = {
   permissionMode?: PermissionMode;
   nonInteractivePermissions?: NonInteractivePermissionPolicy;
   permissionPolicy?: PermissionPolicy;
-  onPermissionRequest?: (
-    req: AcpPermissionRequest,
-    ctx: { signal: AbortSignal },
-  ) => Promise<AcpPermissionDecision | undefined>;
+  onPermissionRequest?: AcpPermissionHandler;
   authCredentials?: Record<string, string>;
   authPolicy?: AuthPolicy;
   fs?: boolean;
   terminal?: boolean;
   elicitationModes?: readonly AcpElicitationMode[];
   resumePolicy?: SessionResumePolicy;
+  replacingConfigOption?: ConnectAndLoadSessionOptions["replacingConfigOption"];
   timeoutMs?: number;
   verbose?: boolean;
   onClientAvailable?: (controller: FullConnectedSessionController) => void;
@@ -133,6 +134,7 @@ export async function withConnectedSession<T>(
           client,
           record,
           resumePolicy: options.resumePolicy,
+          replacingConfigOption: options.replacingConfigOption,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
           activeController,

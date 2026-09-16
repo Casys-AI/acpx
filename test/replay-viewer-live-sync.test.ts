@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
@@ -27,6 +28,102 @@ import type {
   ViewerRunLiveState,
   ViewerRunsState,
 } from "../examples/flows/replay-viewer/src/types.js";
+
+test("replay viewer rejects malformed messages and isolates invalid frames", async () => {
+  const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-admission-"));
+  const viewer = await createReplayViewerServer({
+    host: "127.0.0.1",
+    port: 0,
+    runsDir,
+    livePollIntervalMs: 50,
+  });
+  const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const inbox = createMessageInbox(socket);
+  let invalidSocket: WebSocket | undefined;
+  try {
+    await onceOpen(socket);
+    for (const payload of [
+      "null",
+      "{",
+      JSON.stringify({ type: "subscribe_run", runId: 7 }),
+      JSON.stringify({ type: "resync_run" }),
+    ]) {
+      socket.send(payload);
+      const error = await inbox.next((message) => message.type === "error");
+      assert.equal(error.code, "protocol_error");
+    }
+    socket.send(JSON.stringify({ type: "hello", protocol: "unsupported" }));
+    assert.equal(
+      (await inbox.next((message) => message.type === "error")).message,
+      "Unsupported replay protocol.",
+    );
+    socket.send(Buffer.from(JSON.stringify({ type: "ping" })));
+    await inbox.next((message) => message.type === "pong");
+
+    invalidSocket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+    await onceOpen(invalidSocket);
+    const closed = once(invalidSocket, "close");
+    invalidSocket.send(Buffer.from([0xff]), { binary: false });
+    await closed;
+    socket.send(JSON.stringify({ type: "ping" }));
+    await inbox.next((message) => message.type === "pong");
+    socket.send(JSON.stringify({ type: "subscribe_runs" }));
+    assert.deepEqual(
+      (await inbox.next((message) => message.type === "runs_snapshot")).state.order,
+      [],
+    );
+  } finally {
+    invalidSocket?.terminate();
+    await closeSocket(socket);
+    await viewer.close();
+    await fs.rm(runsDir, { recursive: true, force: true });
+  }
+});
+
+test("replay viewer reports polling failures and resumes live run updates", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-poll-error-"));
+  const runsDir = path.join(directory, "runs");
+  const savedRunsDir = path.join(directory, "saved-runs");
+  await fs.mkdir(runsDir);
+  const viewer = await createReplayViewerServer({
+    host: "127.0.0.1",
+    port: 0,
+    runsDir,
+    livePollIntervalMs: 50,
+  });
+  const socket = new WebSocket(viewer.baseUrl.replace(/^http/, "ws") + "/api/live");
+  const inbox = createMessageInbox(socket);
+  try {
+    await onceOpen(socket);
+    socket.send(JSON.stringify({ type: "subscribe_runs" }));
+    const initial = await inbox.next((message) => message.type === "runs_snapshot");
+    await fs.rename(runsDir, savedRunsDir);
+    await fs.writeFile(runsDir, "not a directory");
+    assert.equal((await inbox.next((message) => message.type === "error")).code, "internal_error");
+    await fs.rm(runsDir);
+    await fs.rename(savedRunsDir, runsDir);
+    await writeRunBundle(runsDir, {
+      runId: "recovered",
+      flowName: "synthetic",
+      runTitle: "Recovered synthetic run",
+      startedAt: "2026-09-15T00:00:00.000Z",
+      projectedStatus: "running",
+      liveStatus: "running",
+      updatedAt: "2026-09-15T00:00:00.000Z",
+      currentNode: "first",
+      steps: [],
+    });
+    const update = await inbox.next((message) => message.type === "runs_patch");
+    assert.equal(
+      applyReplayPatch<ViewerRunsState>(initial.state, update.ops).runsById.recovered?.status,
+      "running",
+    );
+  } finally {
+    await closeSocket(socket);
+    await viewer.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("replay viewer streams live sidebar and run patches over websocket", async () => {
   const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-live-"));
@@ -292,22 +389,28 @@ test("replay viewer streams selected-run ACP text as JSON Patch+ append updates"
 
     await appendLiveSessionChunk(runsDir, runId, sessionId, 3, "lo");
 
-    const runPatch = await inbox.next(
-      (message): message is Extract<ReplayServerMessage, { type: "run_patch" }> =>
-        message.type === "run_patch" && message.runId === runId,
-    );
+    let nextRunState = runSnapshot.state;
+    let runPatch: Extract<ReplayServerMessage, { type: "run_patch" }>;
+    const textPath = "/sessions/main-bundle/record/messages/1/Agent/content/0/Text";
+    const patchDeadline = Date.now() + 5_000;
+    do {
+      const remainingMs = patchDeadline - Date.now();
+      assert.ok(remainingMs > 0, "Timed out waiting for the streamed text patch");
+      runPatch = await inbox.next(
+        (message): message is Extract<ReplayServerMessage, { type: "run_patch" }> =>
+          message.type === "run_patch" && message.runId === runId,
+        remainingMs,
+      );
+      nextRunState = applyReplayPatch<ViewerRunLiveState>(nextRunState, runPatch.ops);
+    } while (!runPatch.ops.some((op) => op.path.endsWith(textPath)));
 
     assert.equal(
       runPatch.ops.some(
-        (op) =>
-          op.op === "append" &&
-          op.path.endsWith("/sessions/main-bundle/record/messages/1/Agent/content/0/Text") &&
-          op.value === "lo",
+        (op) => op.op === "append" && op.path.endsWith(textPath) && op.value === "lo",
       ),
       true,
     );
 
-    const nextRunState = applyReplayPatch<ViewerRunLiveState>(runSnapshot.state, runPatch.ops);
     const nextSession = nextRunState.sessions[sessionId];
     assert.ok(nextSession);
     assert.ok(Array.isArray(nextSession?.record.messages));
@@ -322,6 +425,62 @@ test("replay viewer streams selected-run ACP text as JSON Patch+ append updates"
     await fs.rm(runsDir, { recursive: true, force: true });
   }
 });
+
+for (const sourceType of ["prompt", "user_message_chunk"] as const) {
+  test(`replay projection keeps ${sourceType} identities stable across reads and checkpoints`, async (t) => {
+    const runsDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-replay-identities-"));
+    t.after(() => fs.rm(runsDir, { recursive: true, force: true }));
+    const runId = "stable-identities";
+    const sessionId = "main-bundle";
+    await writeLiveSessionRunBundle(runsDir, {
+      runId,
+      sessionId,
+      promptText: "hello",
+      initialAgentText: "hel",
+    });
+    const sessionDir = path.join(runsDir, runId, "sessions", sessionId);
+    if (sourceType === "user_message_chunk") {
+      const eventsFile = path.join(sessionDir, "events.ndjson");
+      const events = (await fs.readFile(eventsFile, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as FlowBundledSessionEvent);
+      events[0].message = {
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "agent-session",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: { type: "text", text: "hello" },
+          },
+        },
+      };
+      await fs.writeFile(
+        eventsFile,
+        `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+      );
+    }
+
+    const source = createFilesystemRunSource(runsDir);
+    const first = await source.getRunState(runId);
+    assert.deepEqual(await source.getRunState(runId), first);
+
+    await appendLiveSessionChunk(runsDir, runId, sessionId, 3, "lo");
+    const grown = await source.getRunState(runId);
+    assert.deepEqual(await source.getRunState(runId), grown);
+    const firstUser = first.sessions[sessionId].record.messages?.[0];
+    assert.deepEqual(grown.sessions[sessionId].record.messages?.[0], firstUser);
+
+    const checkpoint = structuredClone(grown.sessions[sessionId].record);
+    const checkpointUser = checkpoint.messages?.[0] as { User: { id: string } };
+    checkpointUser.User.id = "persisted-user-id";
+    await fs.writeFile(path.join(sessionDir, "record.json"), JSON.stringify(checkpoint));
+    const restored = await source.getRunState(runId);
+    assert.deepEqual(restored.sessions[sessionId].record.messages?.[0], checkpointUser);
+    assert.deepEqual(await source.getRunState(runId), restored);
+  });
+}
 
 function createMessageInbox(socket: WebSocket) {
   const backlog: ReplayServerMessage[] = [];
@@ -437,11 +596,9 @@ async function createReplayViewerServer(options: {
   });
 
   server.on("upgrade", (request, socket, head) => {
-    void liveSyncServer.handleUpgrade(request, socket, head).then((handled) => {
-      if (!handled) {
-        socket.destroy();
-      }
-    });
+    if (!liveSyncServer.handleUpgrade(request, socket, head)) {
+      socket.destroy();
+    }
   });
 
   await new Promise<void>((resolve, reject) => {

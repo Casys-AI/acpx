@@ -114,6 +114,15 @@ acpx codex sessions import debug.json --name debug-on-laptop
 
 Export refuses to run if the session is locked by a live queue owner. Run `acpx codex sessions close my-debug-session` first.
 
+Exports preserve event order across rotated and active segments, including segments containing hundreds of thousands of events.
+
+Exports publish complete archives atomically. On POSIX systems, archives and
+imported history use `0600` permissions. Exporting preserves the selected output
+directory's permissions and follows existing or dangling output symlinks to their
+targets. Existing non-regular output targets, such as named pipes, are rejected.
+Live event segments also use `0600`; their append and rotation behavior
+is unchanged. Event-log files must be regular files, not symlink or hardlink aliases.
+
 The archive is plain JSON. Paths are stored relative to home, so an imported session lands at `~/<original-cwd-relative>` on the destination machine without embedding the source machine's absolute cwd. Override with `--cwd`.
 
 Imports keep the archive's provider session id, reopen the copied session as an idle local record, and clear source-machine process metadata. Imported sessions must resume that provider session; if the destination agent cannot load it, prompts fail clearly instead of starting an empty conversation. If the destination already has an active session for the same `(agent, cwd, name)` scope, import fails; pass `--name` or `--cwd` to choose a different scope. If a local record already uses the same provider session id, prune or remove that record before importing.
@@ -155,11 +164,18 @@ acpx codex --no-wait 'and propose 1 follow-up fix'
 
 Queue mechanics:
 
+- Startup options pass directly to the detached owner through stdin; acpx does not create temporary bootstrap files containing credentials or session environment values.
 - Owner generates a Unix socket at `~/.acpx/queues/<hash>.sock` (named pipe on Windows) and a `<hash>.lock` ownership file.
 - Sockets and lock files are owner-only.
 - After the queue drains, the owner stays alive for an idle TTL (default `300s`) so quick follow-ups do not pay the spawn cost.
 - Override TTL with `--ttl <seconds>`. `--ttl 0` keeps it alive indefinitely (until idle shutdown is otherwise triggered).
 - Owner generation IDs are cryptographically random so rapid restarts cannot reuse a stale generation token.
+
+Persistent turns from flows and CLI prompts share one owner for each saved session.
+A waiting prompt reads history after the previous turn finishes its final checkpoint,
+so both completions are retained. Waiting can be cancelled or timed out. A live
+writer keeps ownership until it finishes; abandoned locks remain recoverable after
+its process exits.
 
 ### Bridge process lifeline
 
@@ -244,9 +260,33 @@ CWD is stored as an absolute path in the scope key.
 
 Do not pass an `acpx` session id to a native provider CLI unless `agentSessionId` is also present.
 
+## Embedded session lifecycle
+
+Embedding hosts can call `findSession({ sessionKey, agent })` on `acpx/runtime`
+to recover a persistent session handle after restart. It returns `undefined` when
+the record is absent, and does not start an agent or change the record. Existing
+closed records remain available. The handle uses the record's working directory
+and session identities. `getStatus({ handle }).lastRequestId` reports the last
+host request admitted to that session.
+
+Call `shutdown()` when retiring a runtime. It cancels active prompts, closes owned
+connections, and waits for admitted work and probes to finish. New sessions,
+turns, controls and probes then reject. Stored sessions remain available for a
+new runtime to resume. Hosts must still settle their own pending lifecycle
+admission callbacks; shutdown cannot complete an external host operation.
+
+For temporary model inspection, use `ensureSession({ mode: "oneshot", ... })`,
+`getStatus({ handle })`, and `close({ handle, discardPersistentState: true, ... })`.
+Close requests ACP `session/close` and marks the host record closed for reset on
+the next ensure. It does not delete that record or promise removal of an agent's
+private session files.
+
 ## See also
 
 - [Prompting](prompting.md) — implicit prompt, `prompt`, `exec`, stdin, `--file`, `--no-wait`.
 - [Session control](session-control.md) — `cancel`, `set-mode`, `set <key>`, `set model`.
 - [Output formats](output-formats.md) — JSON envelope for sessions/status payloads.
 - [CLI reference](CLI.md#sessions-subcommand) — long-form spec and exit codes.
+
+Embedding hosts can use optional [process lifecycle callbacks](runtime-process-lifecycle.md)
+for launch admission and host-owned process tracking.

@@ -13,7 +13,11 @@ const ZED_TAG_KEYS = new Set([
   "ToolUse",
 ]);
 
-const MAP_OBJECT_PATHS = new Set(["request_token_usage", "messages.Agent.tool_results"]);
+const MAP_OBJECT_PATHS = new Set([
+  "request_token_usage",
+  "messages.Agent.tool_results",
+  "acpx.session_options.env",
+]);
 
 const OPAQUE_VALUE_PATHS = new Set([
   "agent_capabilities",
@@ -28,14 +32,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function joinPath(path: string[]): string {
   return path.join(".");
-}
-
-function isAllowedKey(path: string[], key: string): boolean {
-  if (ZED_TAG_KEYS.has(key)) {
-    return true;
-  }
-
-  return false;
 }
 
 function shouldSkipKeyRule(path: string[]): boolean {
@@ -89,7 +85,7 @@ function collectKeyViolation(
   skipKeyRule: boolean,
   violations: string[],
 ): void {
-  if (!skipKeyRule && !SNAKE_CASE_KEY.test(key) && !isAllowedKey(path, key)) {
+  if (!skipKeyRule && !SNAKE_CASE_KEY.test(key) && !ZED_TAG_KEYS.has(key)) {
     violations.push(`${joinPath(path)}.${key}`.replace(/^\./, ""));
   }
 

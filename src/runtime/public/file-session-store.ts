@@ -1,9 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { assertPersistedKeyPolicy } from "../../persisted-key-policy.js";
-import { createAtomicWriteTempPath } from "../../session/persistence/atomic-write.js";
 import { parseSessionRecord } from "../../session/persistence/parse.js";
 import { serializeSessionRecordForDisk } from "../../session/persistence/serialize.js";
+import { writePrivateJsonFile } from "../../state-files.js";
 import type { AcpFileSessionStoreOptions, AcpSessionRecord, AcpSessionStore } from "./contract.js";
 
 function safeSessionId(sessionId: string): string {
@@ -22,7 +22,7 @@ class FileSessionStore implements AcpSessionStore {
   }
 
   private async ensureDir(): Promise<void> {
-    await fs.mkdir(this.sessionDir, { recursive: true });
+    await fs.mkdir(this.sessionDir, { recursive: true, mode: 0o700 });
   }
 
   async load(sessionId: string): Promise<AcpSessionRecord | undefined> {
@@ -46,15 +46,10 @@ class FileSessionStore implements AcpSessionStore {
   }
 
   async save(record: AcpSessionRecord): Promise<void> {
-    await this.ensureDir();
     const persisted = serializeSessionRecordForDisk(record);
     assertPersistedKeyPolicy(persisted);
 
-    const file = this.filePath(record.acpxRecordId);
-    const tempFile = createAtomicWriteTempPath(file);
-    const payload = JSON.stringify(persisted, null, 2);
-    await fs.writeFile(tempFile, `${payload}\n`, "utf8");
-    await fs.rename(tempFile, file);
+    await writePrivateJsonFile(this.filePath(record.acpxRecordId), persisted);
   }
 }
 

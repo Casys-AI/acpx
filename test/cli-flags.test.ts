@@ -3,6 +3,7 @@ import test from "node:test";
 import { Command } from "commander";
 import type { ResolvedAcpxConfig } from "../src/cli/config.js";
 import {
+  addExecConfigOption,
   addGlobalFlags,
   addPromptInputOption,
   addSessionNameOption,
@@ -17,6 +18,7 @@ import {
   parseOutputFormat,
   parsePruneBeforeDate,
   parsePromptRetries,
+  parseSessionConfigOptionAssignment,
   parseSessionName,
   parseTimeoutSeconds,
   parseTtlSeconds,
@@ -51,9 +53,11 @@ function config(overrides: Partial<ResolvedAcpxConfig> = {}): ResolvedAcpxConfig
 }
 
 function commandWithOptions(options: Record<string, unknown>): Command {
-  return {
-    optsWithGlobals: () => options,
-  } as unknown as Command;
+  const command = new Command();
+  for (const [key, value] of Object.entries(options)) {
+    command.setOptionValue(key, value);
+  }
+  return command;
 }
 
 function parseCommand(command: Command, argv: string[]): Command {
@@ -153,6 +157,22 @@ test("string list flag parsers normalize valid values and reject empty entries",
   assert.deepEqual(parseAllowedTools("   "), []);
   assert.deepEqual(parseAllowedTools("Read, Edit , Bash"), ["Read", "Edit", "Bash"]);
   assert.throws(() => parseAllowedTools("Read,,Edit"), /without empty entries/);
+});
+
+test("session config option assignments preserve values and reject incomplete pairs", () => {
+  assert.deepEqual(parseSessionConfigOptionAssignment(" reasoning_effort = xhigh "), {
+    configId: "reasoning_effort",
+    value: "xhigh",
+  });
+  assert.deepEqual(parseSessionConfigOptionAssignment("endpoint=https://example.com?a=b"), {
+    configId: "endpoint",
+    value: "https://example.com?a=b",
+  });
+  assert.throws(() => parseSessionConfigOptionAssignment("reasoning_effort"), /<key>=<value>/);
+  assert.throws(() => parseSessionConfigOptionAssignment("=xhigh"), /<key>=<value>/);
+  assert.throws(() => parseSessionConfigOptionAssignment("reasoning_effort="), /<key>=<value>/);
+  assert.throws(() => parseSessionConfigOptionAssignment("  =xhigh"), /<key>=<value>/);
+  assert.throws(() => parseSessionConfigOptionAssignment("reasoning_effort=   "), /<key>=<value>/);
 });
 
 test("history and prune parsers validate positive numbers and dates", () => {
@@ -257,29 +277,6 @@ test("resolveGlobalFlags ignores malformed dynamic options and keeps typed confi
   assert.equal(flags.allowedTools, undefined);
   assert.equal(flags.maxTurns, undefined);
   assert.equal(flags.promptRetries, undefined);
-});
-
-test("resolveGlobalFlags treats non-object Commander options as absent", () => {
-  const flags = resolveGlobalFlags(
-    {
-      optsWithGlobals: () => [],
-    } as unknown as Command,
-    config({
-      authPolicy: "fail",
-      nonInteractivePermissions: "fail",
-      ttlMs: 1_234,
-      format: "quiet",
-    }),
-  );
-
-  assert.equal(flags.authPolicy, "fail");
-  assert.equal(flags.nonInteractivePermissions, "fail");
-  assert.equal(flags.ttl, 1_234);
-  assert.equal(flags.format, "quiet");
-  assert.equal(flags.suppressReads, false);
-  assert.equal(flags.approveAll, undefined);
-  assert.equal(flags.approveReads, undefined);
-  assert.equal(flags.denyAll, undefined);
 });
 
 test("resolveGlobalFlags preserves boolean flag intent and alias-only policy values", () => {
@@ -431,29 +428,33 @@ test("session and prompt option registration parse command-local flags", () => {
 
   const promptCommand = parseCommand(addPromptInputOption(new Command()), ["--file", "-"]);
   assert.deepEqual(promptCommand.opts(), { file: "-" });
+
+  const execCommand = parseCommand(addExecConfigOption(new Command()), [
+    "--config-option",
+    "reasoning_effort=high",
+    "--config-option",
+    "verbosity=terse",
+  ]);
+  assert.deepEqual(execCommand.opts(), {
+    configOption: [
+      { configId: "reasoning_effort", value: "high" },
+      { configId: "verbosity", value: "terse" },
+    ],
+  });
 });
 
-test("resolveSessionNameFromFlags falls back through global and parent command options", () => {
-  assert.equal(
-    resolveSessionNameFromFlags({ session: "direct" }, commandWithOptions({})),
-    "direct",
-  );
-
-  assert.equal(
-    resolveSessionNameFromFlags({} as const, commandWithOptions({ session: "global" })),
-    "global",
-  );
-
-  const command = {
-    optsWithGlobals: () => ({}),
-    parent: {
-      opts: () => ({ session: "parent" }),
-    },
-  } as unknown as Command;
-  assert.equal(resolveSessionNameFromFlags({}, command), "parent");
-
-  const commandWithoutCommanderHelpers = {} as unknown as Command;
-  assert.equal(resolveSessionNameFromFlags({}, commandWithoutCommanderHelpers), undefined);
+test("resolveSessionNameFromFlags honors direct and inherited Commander options", () => {
+  for (const [argv, expected] of [
+    [["cancel"], undefined],
+    [["-s", "parent", "cancel"], "parent"],
+    [["cancel", "-s", "child"], "child"],
+  ] as const) {
+    const parent = addSessionNameOption(new Command()).enablePositionalOptions();
+    const child = addSessionNameOption(parent.command("cancel")).action(() => {});
+    parseCommand(parent, [...argv]);
+    assert.equal(resolveSessionNameFromFlags({}, child), expected);
+    assert.equal(resolveSessionNameFromFlags({ session: "direct" }, child), "direct");
+  }
 });
 
 test("resolveOutputPolicy maps json-strict output behavior", () => {

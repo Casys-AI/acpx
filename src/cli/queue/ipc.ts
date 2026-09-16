@@ -17,7 +17,7 @@ import type {
 import { probeQueueOwnerHealth, type QueueOwnerHealth } from "./ipc-health.js";
 import { connectToQueueOwner } from "./ipc-transport.js";
 import {
-  ensureOwnerIsUsable,
+  resolveUsableQueueOwner,
   type QueueOwnerRecord,
   readQueueOwnerRecord,
   terminateQueueOwnerForSession,
@@ -38,6 +38,7 @@ import {
   type QueueSetModeRequest,
   type QueueSubmitRequest,
 } from "./messages.js";
+import { assertQueueRequestSize } from "./request-limit.js";
 
 export { QUEUE_CONNECT_RETRY_MS } from "./ipc-transport.js";
 export const MAX_MESSAGE_BUFFER_SIZE = 10 * 1024 * 1024;
@@ -71,7 +72,7 @@ async function maybeRecoverStaleOwnerAfterProtocolMismatch(params: {
     return false;
   }
 
-  await terminateQueueOwnerForSession(params.sessionId).catch(() => {
+  await terminateQueueOwnerForSession(params.sessionId, params.owner).catch(() => {
     // Preserve existing behavior if cleanup fails.
   });
   incrementPerfCounter("queue.owner.stale_recovered");
@@ -205,6 +206,8 @@ async function runQueueOwnerRequest<TResult>(options: {
   onMessage: (message: QueueOwnerMessage, controls: QueueOwnerRequestControls<TResult>) => void;
   onClose: (controls: QueueOwnerRequestControls<TResult>) => void;
 }): Promise<TResult | undefined> {
+  const requestLine = JSON.stringify(options.request);
+  assertQueueRequestSize(requestLine);
   const socket = await connectToQueueOwner(options.owner);
   if (!socket) {
     return undefined;
@@ -300,7 +303,7 @@ async function runQueueOwnerRequest<TResult>(options: {
       options.onClose(controls);
     });
 
-    socket.write(`${JSON.stringify(options.request)}\n`);
+    socket.write(`${requestLine}\n`);
   });
 }
 
@@ -710,11 +713,12 @@ function assertQueueOwnerMcpConfigMatches(
 export async function trySubmitToRunningOwner(
   options: SubmitToQueueOwnerOptions,
 ): Promise<SessionSendOutcome | undefined> {
-  const owner = await readQueueOwnerRecord(options.sessionId);
-  if (!owner) {
+  const observed = await readQueueOwnerRecord(options.sessionId);
+  if (!observed) {
     return undefined;
   }
-  if (!(await ensureOwnerIsUsable(options.sessionId, owner))) {
+  const owner = await resolveUsableQueueOwner(options.sessionId, observed);
+  if (!owner) {
     return undefined;
   }
   assertQueueOwnerMcpConfigMatches(owner, options);

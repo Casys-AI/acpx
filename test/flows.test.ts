@@ -24,7 +24,7 @@ import type {
   ShellActionExecution,
   ShellActionNodeDefinition,
 } from "../src/flows/runtime.js";
-import { flowRunsBaseDir } from "../src/flows/store.js";
+import { type FlowRunStore, flowRunsBaseDir } from "../src/flows/store.js";
 import type { PromptInput } from "../src/types.js";
 
 const MOCK_AGENT_PATH = fileURLToPath(new URL("./mock-agent.js", import.meta.url));
@@ -1303,6 +1303,77 @@ test("FlowRunner persists active node state while a shell step is running", asyn
   });
 });
 
+for (const rejectWrite of [false, true]) {
+  test(`FlowRunner bounds pending heartbeat writes and resumes after ${rejectWrite ? "failure" : "success"}`, async (t) => {
+    const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-heartbeat-"));
+    let startStep = () => {};
+    let finishStep = () => {};
+    let finishWrite = () => {};
+    const started = new Promise<void>((resolve) => {
+      startStep = resolve;
+    });
+    const step = new Promise<void>((resolve) => {
+      finishStep = resolve;
+    });
+    const write = new Promise<void>((resolve) => {
+      finishWrite = resolve;
+    });
+    const runner = new FlowRunner({
+      resolveAgent: () => ({ agentName: "unused", agentCommand: "unused", cwd: process.cwd() }),
+      permissionMode: "approve-all",
+      outputRoot,
+    });
+    const store = (runner as unknown as { store: FlowRunStore }).store;
+    let writes = 0;
+    t.mock.method(store, "writeLive", async () => {
+      writes += 1;
+      await write;
+      if (rejectWrite) {
+        throw new Error("slow heartbeat storage failed");
+      }
+    });
+    t.mock.timers.enable({ apis: ["setInterval"] });
+
+    const running = runner.run(
+      defineFlow({
+        name: "slow-heartbeat-storage",
+        startAt: "wait",
+        nodes: {
+          wait: compute({
+            heartbeatMs: 25,
+            run: async () => {
+              startStep();
+              await step;
+              return { ok: true };
+            },
+          }),
+        },
+        edges: [],
+      }),
+      {},
+    );
+
+    try {
+      await started;
+      t.mock.timers.tick(25);
+      assert.equal(writes, 1);
+      t.mock.timers.tick(100);
+      assert.equal(writes, 1, "slow storage must not accumulate concurrent heartbeat writes");
+      finishWrite();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      t.mock.timers.tick(25);
+      assert.equal(writes, 2, "heartbeats must resume after the pending write settles");
+      finishStep();
+      assert.equal((await running).state.status, "completed");
+    } finally {
+      finishWrite();
+      finishStep();
+      await running;
+      await fs.rm(outputRoot, { recursive: true, force: true });
+    }
+  });
+}
+
 test("FlowRunner lets ACP nodes run in a dynamic working directory", async () => {
   await withTempHome(async () => {
     const baseCwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-base-cwd-"));
@@ -1452,6 +1523,96 @@ test("FlowRunner marks timed out shell steps explicitly", async () => {
     assert.equal(typeof slowResult.startedAt, "string");
     assert.equal(typeof slowResult.finishedAt, "string");
     assert.equal(typeof slowResult.durationMs, "number");
+  });
+});
+
+test("FlowRunner preserves shell timeoutMs 0 as no action deadline", async () => {
+  await withTempHome(async () => {
+    const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-store-"));
+    const runner = new FlowRunner({
+      resolveAgent: () => ({
+        agentName: "unused",
+        agentCommand: "unused",
+        cwd: process.cwd(),
+      }),
+      permissionMode: "approve-all",
+      outputRoot,
+      defaultNodeTimeoutMs: 5_000,
+    });
+
+    const flow = defineFlow({
+      name: "timeout-zero-ok",
+      startAt: "ok",
+      nodes: {
+        ok: shell({
+          exec: () => ({
+            command: process.execPath,
+            args: ["-e", "setTimeout(() => {}, 80)"],
+            // Explicit zero: no shell-action deadline (must not become 1ms SIGTERM).
+            timeoutMs: 0,
+          }),
+        }),
+      },
+      edges: [],
+    });
+
+    const result = await runner.run(flow, {});
+    assert.equal(result.state.status, "completed");
+  });
+});
+
+test("FlowRunner reaps shell child when outer node deadline expires", async () => {
+  await withTempHome(async () => {
+    const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-store-"));
+    const pidDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-shell-pid-"));
+    const pidFile = path.join(pidDir, "pid");
+    const runner = new FlowRunner({
+      resolveAgent: () => ({
+        agentName: "unused",
+        agentCommand: "unused",
+        cwd: process.cwd(),
+      }),
+      permissionMode: "approve-all",
+      outputRoot,
+    });
+
+    const flow = defineFlow({
+      name: "timeout-outer-reap",
+      startAt: "slow",
+      nodes: {
+        slow: shell({
+          // Enabled outer deadline; action timeout stays zero (no shell-level deadline).
+          timeoutMs: 500,
+          exec: () => ({
+            command: process.execPath,
+            args: [
+              "-e",
+              `require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => {}, 30_000)`,
+            ],
+            timeoutMs: 0,
+          }),
+        }),
+      },
+      edges: [],
+    });
+
+    await assert.rejects(async () => await runner.run(flow, {}), TimeoutError);
+    const runDir = await waitForRunDir(outputRoot, "timeout-outer-reap");
+    const state = await readRunJson(runDir);
+    assert.equal(state.status, "timed_out");
+    const slowResult = (state.results as Record<string, Record<string, unknown>>).slow;
+    assert.equal(slowResult.outcome, "timed_out");
+
+    const pid = Number(await fs.readFile(pidFile, "utf8"));
+    assert.ok(pid > 0);
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    assert.equal(alive, false, "outer deadline must reap the shell child");
+    await fs.rm(pidDir, { recursive: true, force: true });
   });
 });
 
@@ -1822,3 +1983,49 @@ async function waitFor<T>(fn: () => Promise<T | null>, timeoutMs: number): Promi
 
   throw lastError instanceof Error ? lastError : new Error("Timed out waiting for condition");
 }
+
+test("FlowRunner does not launch a shell action when its executor resolves after timeout", async () => {
+  await withTempHome(async () => {
+    const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-flow-late-"));
+    const marker = path.join(outputRoot, "must-not-exist");
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const runner = new FlowRunner({
+      resolveAgent: () => ({ agentName: "unused", agentCommand: "unused", cwd: outputRoot }),
+      permissionMode: "deny-all",
+      outputRoot,
+    });
+    const flow = defineFlow({
+      name: "late-executor",
+      startAt: "late",
+      nodes: {
+        late: shell({
+          timeoutMs: 20,
+          exec: async () => {
+            await gate;
+            return {
+              command: process.execPath,
+              args: [
+                "-e",
+                `require('node:fs').writeFileSync(${JSON.stringify(marker)},'launched')`,
+              ],
+              timeoutMs: 0,
+            };
+          },
+        }),
+      },
+      edges: [],
+    });
+    try {
+      await assert.rejects(runner.run(flow, {}), TimeoutError);
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await assert.rejects(fs.access(marker), { code: "ENOENT" });
+    } finally {
+      release();
+      await fs.rm(outputRoot, { recursive: true, force: true });
+    }
+  });
+});

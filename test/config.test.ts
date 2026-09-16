@@ -110,6 +110,37 @@ test("loadResolvedConfig merges global and project config with project priority"
   });
 });
 
+test("project scalar values skip invalid shadowed global values", async () => {
+  await withTempEnv(async ({ homeDir }) => {
+    const cwd = path.join(homeDir, "workspace");
+    const globalPath = path.join(homeDir, ".acpx", "config.json");
+    await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(path.dirname(globalPath), { recursive: true });
+    const project = {
+      defaultAgent: "custom",
+      defaultPermissions: "deny-all",
+      nonInteractivePermissions: "fail",
+      authPolicy: "fail",
+      ttl: 2,
+      queueMaxDepth: 3,
+      format: "quiet",
+      disableExec: false,
+    };
+    await fs.writeFile(
+      globalPath,
+      JSON.stringify(Object.fromEntries(Object.keys(project).map((key) => [key, {}]))),
+    );
+    await fs.writeFile(path.join(cwd, ".acpxrc.json"), JSON.stringify(project));
+    const resolved = await loadResolvedConfig(cwd);
+    assert.deepEqual(toConfigDisplay(resolved), {
+      ...project,
+      timeout: null,
+      agents: {},
+      authMethods: [],
+    });
+  });
+});
+
 test("loadResolvedConfig normalizes timer values through the CLI timer boundary", async () => {
   await withTempEnv(async ({ homeDir }) => {
     const cwd = path.join(homeDir, "workspace");
@@ -220,11 +251,17 @@ test("loadResolvedConfig rejects a missing explicit MCP config path", async () =
   });
 });
 
-test("initGlobalConfigFile creates the config once and then reports existing file", async () => {
+test("initGlobalConfigFile creates the config once and then reports existing file", async (t) => {
+  const previousUmask = process.umask(0o002);
+  t.after(() => process.umask(previousUmask));
   await withTempEnv(async ({ homeDir }) => {
     const first = await initGlobalConfigFile();
     assert.equal(first.created, true);
     assert.equal(first.path, path.join(homeDir, ".acpx", "config.json"));
+    if (process.platform !== "win32") {
+      assert.equal((await fs.stat(first.path)).mode & 0o777, 0o600);
+      assert.equal((await fs.stat(path.dirname(first.path))).mode & 0o777, 0o700);
+    }
 
     const second = await initGlobalConfigFile();
     assert.equal(second.created, false);

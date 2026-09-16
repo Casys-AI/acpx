@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { PromptInput } from "../src/prompt-content.js";
 import { runPromptTurn } from "../src/runtime/engine/prompt-turn.js";
 import {
@@ -13,6 +13,7 @@ import {
   recordPromptSubmission,
   recordSessionUpdate,
 } from "../src/session/conversation-model.js";
+import type { SessionRecord } from "../src/types.js";
 import {
   extractAgentMessageChunkText,
   extractJsonRpcId,
@@ -34,6 +35,9 @@ const FLOW_ACP_DISCONNECT_FIXTURE_PATH = fileURLToPath(
 );
 const FLOW_WAIT_FIXTURE_PATH = fileURLToPath(
   new URL("./fixtures/flow-wait.flow.js", import.meta.url),
+);
+const FLOW_SESSION_TURN_FIXTURE_PATH = fileURLToPath(
+  new URL("./fixtures/flow-session-turn.flow.js", import.meta.url),
 );
 const FLOW_WORKDIR_FIXTURE_PATH = fileURLToPath(
   new URL("./fixtures/flow-workdir.flow.js", import.meta.url),
@@ -76,6 +80,81 @@ test("integration: exec echo baseline", async () => {
     }
   });
 });
+
+for (const completion of ["complete", "timeout", "cancel"] as const) {
+  test(`integration: session turn ownership preserves a live flow during CLI ${completion}`, async () => {
+    await withTempHome(async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      await fs.mkdir(cwd);
+      const base = [...baseLoadCapableAgentArgs(cwd), "--format", "json", "--ttl", "1"];
+      const flow = runCli([...base, "flow", "run", FLOW_SESSION_TURN_FIXTURE_PATH], homeDir);
+      let queued: Promise<CliRunResult> | undefined;
+      let name: string | undefined;
+      try {
+        const entry = await waitFor(async () => {
+          const index = JSON.parse(
+            await fs.readFile(path.join(homeDir, ".acpx", "sessions", "index.json"), "utf8"),
+          ) as { entries: Array<{ name: string; file: string; acpxRecordId: string }> };
+          return (
+            index.entries.find((value) => value.name.startsWith("fixture-session-turn")) ?? null
+          );
+        }, 5_000);
+        name = entry.name;
+        const recordPath = path.join(homeDir, ".acpx", "sessions", entry.file);
+        await waitFor(async () => {
+          const record = JSON.parse(await fs.readFile(recordPath, "utf8")) as SessionRecord;
+          return record.messages.some(
+            (message) =>
+              typeof message === "object" &&
+              "Agent" in message &&
+              JSON.stringify(message.Agent.content).includes("flow-held"),
+          )
+            ? true
+            : null;
+        }, 5_000);
+        const timeoutArgs = completion === "timeout" ? ["--timeout", "0.2"] : [];
+        queued = runCli(
+          [...base, ...timeoutArgs, "prompt", "-s", name, `echo cli-${completion}`],
+          homeDir,
+        );
+        if (completion === "cancel") {
+          await waitFor(async () => {
+            const cancelled = await runCli([...base, "cancel", "-s", entry.name], homeDir);
+            if (cancelled.code !== 0) {
+              return null;
+            }
+            return (JSON.parse(cancelled.stdout) as { cancelled: boolean }).cancelled ? true : null;
+          }, 5_000);
+        }
+        const queuedResult = await queued;
+        const flowResult = await flow;
+        assert.equal(flowResult.code, 0, flowResult.stderr);
+        const record = await fs.readFile(recordPath, "utf8");
+        assert.match(record, /stream-sleep done: flow-held/);
+        if (completion === "complete") {
+          assert.equal(queuedResult.code, 0, queuedResult.stderr);
+          assert.match(record, /cli-complete/);
+          const saved = JSON.parse(record) as { last_seq: number };
+          const events = await fs.readFile(recordPath.replace(/\.json$/, ".stream.ndjson"), "utf8");
+          assert.equal(saved.last_seq, events.trim().split("\n").length);
+        } else {
+          assert.doesNotMatch(record, new RegExp(`cli-${completion}`));
+          if (completion === "timeout") {
+            assert.notEqual(queuedResult.code, 0);
+          } else {
+            assert.equal(queuedResult.code, 0, queuedResult.stderr);
+            assert.equal(queuedResult.stdout, "", "canceled waiters must not send ACP requests");
+          }
+        }
+      } finally {
+        await Promise.allSettled([flow, queued]);
+        if (name) {
+          await runCli([...base, "sessions", "close", name], homeDir);
+        }
+      }
+    });
+  });
+}
 
 test("integration: built-in cursor agent resolves to cursor-agent acp", async () => {
   await withTempHome(async (homeDir) => {
@@ -935,6 +1014,33 @@ test("integration: built-in grok-build agent resolves to grok agent stdio", asyn
   });
 });
 
+test("integration: built-in mcode agent resolves to mcode acp", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-fake-mcode-"));
+
+    try {
+      await writeFakeMCodeAgent(fakeBinDir);
+
+      const result = await runCli(
+        ["--approve-all", "--cwd", cwd, "--format", "quiet", "mcode", "exec", "echo hello"],
+        homeDir,
+        {
+          env: {
+            PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
+          },
+        },
+      );
+
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /hello/);
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: built-in pool agent resolves to pool acp", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -1471,6 +1577,120 @@ test("integration: exec --model sets the advertised model config option", async 
   });
 });
 
+test("integration: exec applies config options after the model and before the prompt", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const configAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-config-options`;
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          configAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "--model",
+          "fast-model",
+          "exec",
+          "--config-option",
+          "reasoning_effort=high",
+          "--config-option",
+          "reasoning_effort=xhigh",
+          "echo hello",
+        ],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const modelIndex = payloads.findIndex(
+        (payload) =>
+          payload.method === "session/set_config_option" &&
+          (payload.params as { configId?: unknown } | undefined)?.configId === "model",
+      );
+      const highEffortIndex = payloads.findIndex(
+        (payload) =>
+          payload.method === "session/set_config_option" &&
+          (payload.params as { configId?: unknown; value?: unknown } | undefined)?.configId ===
+            "reasoning_effort" &&
+          (payload.params as { value?: unknown } | undefined)?.value === "high",
+      );
+      const xhighEffortIndex = payloads.findIndex(
+        (payload) =>
+          payload.method === "session/set_config_option" &&
+          (payload.params as { configId?: unknown; value?: unknown } | undefined)?.configId ===
+            "reasoning_effort" &&
+          (payload.params as { value?: unknown } | undefined)?.value === "xhigh",
+      );
+      const promptIndex = payloads.findIndex((payload) => payload.method === "session/prompt");
+      assert(modelIndex >= 0, "expected model config request");
+      assert(highEffortIndex > modelIndex, "expected first config option after model selection");
+      assert(
+        xhighEffortIndex > highEffortIndex,
+        "expected repeated config options in command-line order",
+      );
+      assert(promptIndex > xhighEffortIndex, "expected prompt after all config option selections");
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: exec stops before prompting when a config option is rejected", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const rejectingAgentCommand = `${MOCK_AGENT_COMMAND} --advertise-config-options --set-session-config-invalid-params`;
+
+    try {
+      const result = await runCli(
+        [
+          "--agent",
+          rejectingAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "exec",
+          "--config-option",
+          "reasoning_effort=xhigh",
+          "echo hello",
+        ],
+        homeDir,
+      );
+      assert.notEqual(result.code, 0, "expected non-zero exit");
+
+      const payloads = parseJsonRpcOutputLines(result.stdout);
+      const rejectedRequest = payloads.find(
+        (payload) =>
+          payload.method === "session/set_config_option" &&
+          (payload.params as { configId?: unknown } | undefined)?.configId === "reasoning_effort",
+      ) as { id?: unknown } | undefined;
+      assert(rejectedRequest, "expected rejected config option request");
+      const rejection = payloads.find(
+        (payload) => payload.id === rejectedRequest.id && "error" in payload,
+      ) as
+        | {
+            error?: { code?: unknown; message?: unknown; data?: { details?: unknown } };
+          }
+        | undefined;
+      assert.equal(rejection?.error?.code, -32603);
+      assert.equal(rejection?.error?.message, "Internal error");
+      assert.equal(rejection?.error?.data?.details, "Invalid params");
+      assert.equal(
+        payloads.some((payload) => payload.method === "session/prompt"),
+        false,
+        "prompt must not start after a rejected config option",
+      );
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 test("integration: exec --model fails when agent does not advertise models", async () => {
   await withTempHome(async (homeDir) => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
@@ -1608,10 +1828,35 @@ test("integration: prompt --model updates existing session model before prompt",
 
     try {
       const created = await runCli(
-        ["--agent", modelAgentCommand, "--approve-all", "--cwd", cwd, "sessions", "new"],
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "--format",
+          "json",
+          "sessions",
+          "new",
+        ],
         homeDir,
       );
       assert.equal(created.code, 0, created.stderr);
+      const { acpxRecordId } = JSON.parse(created.stdout.trim()) as { acpxRecordId: string };
+      const effort = await runCli(
+        [
+          "--agent",
+          modelAgentCommand,
+          "--approve-all",
+          "--cwd",
+          cwd,
+          "set",
+          "reasoning_effort",
+          "high",
+        ],
+        homeDir,
+      );
+      assert.equal(effort.code, 0, effort.stderr);
 
       const result = await runCli(
         [
@@ -1647,6 +1892,15 @@ test("integration: prompt --model updates existing session model before prompt",
       );
       assert.equal(status.code, 0, status.stderr);
       assert.equal((JSON.parse(status.stdout.trim()) as { model?: string }).model, "fast-model");
+      const stored = JSON.parse(
+        await fs.readFile(
+          path.join(homeDir, ".acpx", "sessions", `${encodeURIComponent(acpxRecordId)}.json`),
+          "utf8",
+        ),
+      ) as {
+        acpx?: { desired_config_options?: Record<string, string> };
+      };
+      assert.equal(stored.acpx?.desired_config_options?.reasoning_effort, "medium");
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -1739,6 +1993,37 @@ test("integration: sessions new --model fails when the model config update fails
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
+  });
+});
+
+test("integration: model selection targets the model control when provider shares its category", async () => {
+  await withTempHome(async (homeDir) => {
+    const result = await runCli(
+      [
+        "--agent",
+        `${MOCK_AGENT_COMMAND} --advertise-model-provider`,
+        "--cwd",
+        homeDir,
+        "--format",
+        "json",
+        "--model",
+        "smart-model",
+        "exec",
+        "echo selected-model",
+      ],
+      homeDir,
+    );
+    assert.equal(result.code, 0, result.stderr);
+    const messages = parseJsonRpcOutputLines(result.stdout);
+    const modelRequests = messages.filter(
+      (message) => message.method === "session/set_config_option",
+    );
+    assert.equal(modelRequests.length, 1);
+    assert.partialDeepStrictEqual(modelRequests[0].params, {
+      configId: "model",
+      value: "smart-model",
+    });
+    assert.match(result.stdout, /selected-model/);
   });
 });
 
@@ -3217,6 +3502,33 @@ test("integration: fs/read_text_file through mock agent", async () => {
       const result = await runCli([...baseExecArgs(cwd), `read ${readPath}`], homeDir);
       assert.equal(result.code, 0, result.stderr);
       assert.match(result.stdout, /mock read content/);
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+test("integration: missing file reads return the ACP resource-not-found error", async () => {
+  await withTempHome(async (homeDir) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-integration-cwd-"));
+    const readPath = path.join(cwd, "missing.txt");
+
+    try {
+      const result = await runCli(
+        [...baseAgentArgs(cwd), "--format", "json", "--json-strict", "exec", `read ${readPath}`],
+        homeDir,
+      );
+      assert.equal(result.code, 0, result.stderr);
+      const messages = parseJsonRpcOutputLines(result.stdout);
+      const request = messages.find((message) => message.method === "fs/read_text_file");
+      assert.ok(request);
+      const response = messages.find((message) => message.id === request.id && "error" in message);
+      const uri = pathToFileURL(readPath).href;
+      assert.deepEqual(response?.error, {
+        code: -32002,
+        message: `Resource not found: ${uri}`,
+        data: { uri },
+      });
     } finally {
       await fs.rm(cwd, { recursive: true, force: true });
     }
@@ -4710,6 +5022,39 @@ async function writeFakeGrokBuildAgent(binDir: string): Promise<void> {
   );
 }
 
+async function writeFakeMCodeAgent(binDir: string): Promise<void> {
+  if (process.platform === "win32") {
+    await fs.writeFile(
+      path.join(binDir, "mcode.cmd"),
+      [
+        "@echo off",
+        "setlocal",
+        'if not "%~1"=="acp" exit /b 2',
+        `"${process.execPath}" "${MOCK_AGENT_PATH}" %2 %3 %4 %5 %6 %7 %8 %9`,
+        "",
+      ].join("\r\n"),
+      { encoding: "utf8" },
+    );
+    return;
+  }
+
+  await fs.writeFile(
+    path.join(binDir, "mcode"),
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "acp" ]; then',
+      "  shift",
+      "else",
+      '  echo "unexpected mcode command: $*" 1>&2',
+      "  exit 2",
+      "fi",
+      `exec "${process.execPath}" "${MOCK_AGENT_PATH}" "$@"`,
+      "",
+    ].join("\n"),
+    { encoding: "utf8", mode: 0o755 },
+  );
+}
+
 async function writeFakePoolAgent(binDir: string): Promise<void> {
   if (process.platform === "win32") {
     await fs.writeFile(
@@ -5395,10 +5740,10 @@ test("runPromptTurn: request readiness does not replace the awaited prompt lifec
     prompt: async (
       _sessionId: string,
       _prompt: PromptInput | string,
-      onRequestStarted?: () => Promise<void> | void,
+      onRequestWritten?: () => Promise<void> | void,
     ) => {
       calls.push("prompt");
-      await onRequestStarted?.();
+      await onRequestWritten?.();
       return { stopReason: "end_turn" as const };
     },
   };
@@ -5409,8 +5754,8 @@ test("runPromptTurn: request readiness does not replace the awaited prompt lifec
     sessionId: "session-prompt-barrier",
     prompt: "hello",
     conversation,
-    onPromptRequestStarted: () => {
-      calls.push("request-started");
+    onPromptRequestWritten: () => {
+      calls.push("request-written");
     },
     onPromptStarted: async () => {
       calls.push("lifecycle-started");
@@ -5420,11 +5765,11 @@ test("runPromptTurn: request readiness does not replace the awaited prompt lifec
   });
 
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  assert.deepEqual(calls, ["prompt", "request-started", "lifecycle-started"]);
+  assert.deepEqual(calls, ["prompt", "request-written", "lifecycle-started"]);
 
   releaseLifecycleBarrier();
   await pending;
-  assert.deepEqual(calls, ["prompt", "request-started", "lifecycle-started", "lifecycle-released"]);
+  assert.deepEqual(calls, ["prompt", "request-written", "lifecycle-started", "lifecycle-released"]);
 });
 
 test("runPromptTurn: prompt response usage is recorded after usage update drain", async () => {
@@ -5481,6 +5826,134 @@ test("runPromptTurn: prompt response usage is recorded after usage update drain"
     thought_tokens: 42,
     total_tokens: 84893,
   });
+});
+
+test("runPromptTurn: prompt response metadata is preserved", async () => {
+  const responseMeta = {
+    codex: {
+      turnConfiguration: {
+        version: 1,
+        turns: [
+          {
+            turnId: "turn-1",
+            requested: { model: "gpt-5.6-sol", effort: "xhigh" },
+          },
+        ],
+      },
+    },
+  };
+  const result = await runPromptTurn({
+    client: {
+      prompt: async () => ({
+        stopReason: "end_turn" as const,
+        _meta: responseMeta,
+      }),
+    },
+    sessionId: "session-response-meta",
+    prompt: "hello",
+    conversation: createSessionConversation(),
+  });
+
+  assert.deepEqual(result, {
+    stopReason: "end_turn",
+    source: "rpc",
+    _meta: responseMeta,
+  });
+});
+
+test("runPromptTurn: absent prompt response metadata stays absent", async () => {
+  const result = await runPromptTurn({
+    client: {
+      prompt: async () => ({ stopReason: "end_turn" as const }),
+    },
+    sessionId: "session-response-no-meta",
+    prompt: "hello",
+    conversation: createSessionConversation(),
+  });
+
+  assert.deepEqual(result, {
+    stopReason: "end_turn",
+    source: "rpc",
+  });
+  assert.equal(Object.hasOwn(result, "_meta"), false);
+});
+
+test("runPromptTurn: null prompt response metadata is preserved", async () => {
+  const result = await runPromptTurn({
+    client: {
+      prompt: async () => ({
+        stopReason: "end_turn" as const,
+        _meta: null,
+      }),
+    },
+    sessionId: "session-response-null-meta",
+    prompt: "hello",
+    conversation: createSessionConversation(),
+  });
+
+  assert.deepEqual(result, {
+    stopReason: "end_turn",
+    source: "rpc",
+    _meta: null,
+  });
+});
+
+test("runPromptTurn: timeout recovery preserves a response that settles during draining", async () => {
+  const responseMeta = {
+    codex: {
+      turnConfiguration: {
+        version: 1,
+        turns: [{ turnId: "turn-timeout", requested: { effort: "xhigh" } }],
+      },
+    },
+  };
+  const conversation = createSessionConversation();
+  const promptMessageId = recordPromptSubmission(conversation, "hello");
+  assert.ok(promptMessageId);
+  let resolvePrompt: (value: {
+    stopReason: "end_turn";
+    usage: { inputTokens: number };
+    _meta: typeof responseMeta;
+  }) => void = () => {};
+  const promptResponse = new Promise<{
+    stopReason: "end_turn";
+    usage: { inputTokens: number };
+    _meta: typeof responseMeta;
+  }>((resolve) => {
+    resolvePrompt = resolve;
+  });
+
+  const result = await runPromptTurn({
+    client: {
+      prompt: async () => await promptResponse,
+      waitForSessionUpdatesIdle: async () => {
+        recordSessionUpdate(conversation, undefined, {
+          sessionId: "session-timeout-meta",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "completed during drain" },
+          },
+        });
+        resolvePrompt({
+          stopReason: "end_turn",
+          usage: { inputTokens: 17 },
+          _meta: responseMeta,
+        });
+      },
+    },
+    sessionId: "session-timeout-meta",
+    prompt: "hello",
+    timeoutMs: 1,
+    conversation,
+    promptMessageId,
+  });
+
+  assert.deepEqual(result, {
+    stopReason: "end_turn",
+    source: "session",
+    _meta: responseMeta,
+  });
+  assert.equal(conversation.request_token_usage[promptMessageId]?.input_tokens, 17);
 });
 
 test("runPromptTurn: late session updates after successful prompt reach the drain", async () => {

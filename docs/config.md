@@ -27,6 +27,9 @@ Create a global template (only writes if the file does not already exist):
 acpx config init
 ```
 
+On POSIX systems, newly created config files use `0600` permissions and a newly
+created `.acpx` directory uses `0700`. Existing config files are never replaced.
+
 ## Supported keys
 
 ```json
@@ -153,6 +156,7 @@ Other ACP-relevant behavior:
 
 - Session storage path is derived from the OS home directory (`~/.acpx/sessions`).
 - Child adapter processes inherit the current environment by default.
+- Embedded clients can persist per-session overrides through `SessionAgentOptions.env`; environment variable names retain their exact casing when saved and reloaded.
 - Some adapters look at their own env vars (e.g., `QODER_PERSONAL_ACCESS_TOKEN`) — see [Agents](agents.md) for per-adapter notes.
 
 ## Practical config recipes
@@ -206,9 +210,26 @@ Other ACP-relevant behavior:
 
 Then `acpx ci-bot 'run sanity checks'` resolves through the registry without any `--agent` flag.
 
+## Embedded session MCP servers
+
+In `acpx/runtime`, `AcpRuntimeOptions.mcpServers` accepts either an array or a
+synchronous resolver receiving `{ sessionKey, cwd, agentCommand, agentArgv }`.
+The resolver returns the complete server array for a new connection. ACPX calls
+it for session creation, reconnection, and controls or close operations that need
+a new connection. Existing retained connections keep their original servers.
+Initialization-only health probes do not invoke the resolver.
+
+The runtime does not store the resolver or its result in session records. Hosts
+must supply it again after restart. Configuration files continue to accept arrays
+only. See [Permissions](permissions.md#per-tool-policy) for turn-owned permission
+callbacks on a shared runtime.
+
 ## See also
 
 - [Agents](agents.md) — built-in registry and per-agent notes.
 - [Custom agents](custom-agents.md) — `--agent` escape hatch and unknown positional names.
 - [Permissions](permissions.md) — `defaultPermissions` and non-interactive policy.
 - [Output formats](output-formats.md) — `format` default and `--json-strict`.
+
+Embedded hosts can also supply a [transient runtime environment](runtime-environment.md)
+without persisting child-process settings in a session.

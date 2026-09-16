@@ -59,6 +59,12 @@ test("kiro built-in uses kiro-cli-chat directly", () => {
   assert.equal(resolveAgentCommand("kiro"), "kiro-cli-chat acp");
 });
 
+test("mcode built-in launches the native MCode ACP server", () => {
+  assert.equal(AGENT_REGISTRY.mcode, "mcode acp");
+  assert.deepEqual(AGENT_ARGV_REGISTRY.mcode, ["mcode", "acp"]);
+  assert.equal(resolveAgentCommand("mcode"), "mcode acp");
+});
+
 test("fast-agent built-in runs the ACP entrypoint through uvx", () => {
   assert.equal(AGENT_REGISTRY["fast-agent"], "uvx fast-agent-mcp acp");
   assert.equal(resolveAgentCommand("fast-agent"), "uvx fast-agent-mcp acp");
@@ -106,6 +112,7 @@ test("listBuiltInAgents preserves the required example prefix and alphabetical t
     "kilocode",
     "kimi",
     "kiro",
+    "mcode",
     "mux",
     "opencode",
     "pool",
@@ -121,14 +128,14 @@ test("default agent is codex", () => {
 });
 
 test("claude built-in uses the current ACP adapter package range", () => {
-  assert.equal(BUILT_IN_AGENT_PACKAGES.claude.packageRange, "^0.60.0");
-  assert.equal(AGENT_REGISTRY.claude, "npx -y @agentclientprotocol/claude-agent-acp@^0.60.0");
+  assert.equal(BUILT_IN_AGENT_PACKAGES.claude.packageRange, "^0.76.0");
+  assert.equal(AGENT_REGISTRY.claude, "npx -y @agentclientprotocol/claude-agent-acp@^0.76.0");
 });
 
 test("npm-backed built-ins use current adapter package ranges", () => {
   assert.equal(BUILT_IN_AGENT_PACKAGES.codex.packageRange, "^1.1.5");
   assert.equal(AGENT_REGISTRY.codex, "npx -y @agentclientprotocol/codex-acp@^1.1.5");
-  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.31");
+  assert.equal(AGENT_REGISTRY.pi, "npx pi-acp@^0.0.33");
 });
 
 test("resolveInstalledBuiltInAgentLaunch uses a locally installed adapter when available", (t) => {

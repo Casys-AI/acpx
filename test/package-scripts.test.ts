@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
@@ -22,6 +25,16 @@ test("lint script covers conformance runner sources", () => {
   assert.match(lintScript, /\bconformance\b/);
 });
 
+test("lockfile keeps project dependencies visible to single-document consumers", () => {
+  const lockfile = readFileSync(path.join(process.cwd(), "pnpm-lock.yaml"), "utf8");
+  const documents = lockfile.split(/^---\s*$/m).filter((document) => document.trim());
+
+  // Dependabot currently reads only the first document (dependabot-core#15904).
+  assert.equal(documents.length, 1, "The dependency graph must remain a single YAML document");
+  assert.match(documents[0], /\nimporters:\n/);
+  assert.match(documents[0], /\n {4}dependencies:\n/);
+});
+
 test("coverage script excludes generated package output", () => {
   const pkg = readPackageJson();
   const coverageScript = pkg.scripts?.["test:coverage"] ?? "";
@@ -36,7 +49,10 @@ test("coverage script excludes generated package output", () => {
   assert.match(coverageScript, /dist-test\/src\/flows\/schema\.js/);
   assert.match(coverageScript, /dist-test\/src\/runtime\/public\/\*\*\/\*\.js/);
   assert.match(coverageScript, /dist-test\/src\/runtime\/engine\/manager\.js/);
-  assert.match(coverageScript, /node --test dist-test\/test\/\*\.test\.js && c8\b/);
+  assert.match(
+    coverageScript,
+    /node --test(?: --test-concurrency=\d+)? dist-test\/test\/\*\.test\.js && c8\b/,
+  );
   assert.match(coverageScript, /dist-test\/test\/flows\.test\.js/);
   assert.match(coverageScript, /dist-test\/test\/runtime-manager\.test\.js/);
   assert.match(coverageScript, /--exclude ['"]?dist\/\*\*\/\*\.js['"]?/);
@@ -96,4 +112,27 @@ test("packaged builds include the native lifeline", () => {
   assert.match(pkg.scripts?.dev ?? "", /^pnpm run build:native && tsx /);
   assert.equal(pkg.scripts?.["build:native"], "node scripts/build-native-lifeline.mjs");
   assert.equal(pkg.bin?.["acpx-lifeline"], "dist/native/lifeline");
+});
+
+test("documentation lint rejects unterminated TOML configuration without hanging", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "acpx-doclint-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const config = path.join(directory, "invalid.toml");
+  writeFileSync(config, "a=[1 #");
+  writeFileSync(path.join(directory, "README.md"), "# Fixture\n");
+  const require = createRequire(import.meta.url);
+  const cli = path.join(
+    path.dirname(require.resolve("markdownlint-cli2")),
+    "markdownlint-cli2-bin.mjs",
+  );
+
+  const result = spawnSync(process.execPath, [cli, "--config", config, "README.md"], {
+    cwd: directory,
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+
+  assert.equal(result.error, undefined, "documentation lint must exit before the timeout");
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /Invalid TOML document: cannot find end of structure/);
 });

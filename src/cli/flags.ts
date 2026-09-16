@@ -62,6 +62,12 @@ export type PromptFlags = {
 
 export type ExecFlags = {
   file?: string;
+  configOption?: SessionConfigOptionAssignment[];
+};
+
+export type SessionConfigOptionAssignment = {
+  configId: string;
+  value: string;
 };
 
 export type SessionsNewFlags = {
@@ -103,12 +109,6 @@ export type SessionsPruneFlags = {
   olderThan?: number;
   includeHistory?: boolean;
 };
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
 
 function stringOption(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
@@ -193,6 +193,31 @@ export function parseNonEmptyValue(label: string, value: string): string {
     throw new InvalidArgumentError(`${label} must not be empty`);
   }
   return trimmed;
+}
+
+export function parseSessionConfigOptionAssignment(value: string): SessionConfigOptionAssignment {
+  const separator = value.indexOf("=");
+  if (separator <= 0 || separator === value.length - 1) {
+    throw new InvalidArgumentError(
+      'Session config option must use "<key>=<value>" with non-empty parts',
+    );
+  }
+
+  const configId = value.slice(0, separator).trim();
+  const configValue = value.slice(separator + 1).trim();
+  if (configId.length === 0 || configValue.length === 0) {
+    throw new InvalidArgumentError(
+      'Session config option must use "<key>=<value>" with non-empty parts',
+    );
+  }
+  return { configId, value: configValue };
+}
+
+function collectSessionConfigOptionAssignment(
+  value: string,
+  previous: SessionConfigOptionAssignment[] = [],
+): SessionConfigOptionAssignment[] {
+  return [...previous, parseSessionConfigOptionAssignment(value)];
 }
 
 export function parseHistoryLimit(value: string): number {
@@ -391,16 +416,8 @@ export function resolveSessionNameFromFlags(
   // Commander parses options on the parent command when flags appear before the
   // subcommand (e.g. `acpx codex -s foo cancel`). Use optsWithGlobals() so
   // subcommands can still access those values.
-  const allOpts = asRecord(
-    (command as unknown as { optsWithGlobals?: () => unknown }).optsWithGlobals?.(),
-  );
-  const globalSession = parseOptionalSessionName(allOpts?.session);
-  if (globalSession !== undefined) {
-    return globalSession;
-  }
-
-  const parentOpts = asRecord(command.parent?.opts?.());
-  return parseOptionalSessionName(parentOpts?.session);
+  const allOpts = command.optsWithGlobals<Record<string, unknown>>();
+  return parseOptionalSessionName(allOpts.session);
 }
 
 function parseOptionalSessionName(value: unknown): string | undefined {
@@ -412,8 +429,16 @@ export function addPromptInputOption(command: Command): Command {
   return command.option("-f, --file <path>", "Read prompt text from file path (use - for stdin)");
 }
 
+export function addExecConfigOption(command: Command): Command {
+  return command.option(
+    "--config-option <key=value>",
+    "Set an ACP session config option before the one-shot prompt (repeatable)",
+    collectSessionConfigOptionAssignment,
+  );
+}
+
 export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig): GlobalFlags {
-  const opts = asRecord(command.optsWithGlobals()) ?? {};
+  const opts = command.optsWithGlobals<Record<string, unknown>>();
   const format = parseOutputFormat(stringOption(opts.format) ?? config.format ?? "text");
   const jsonStrict = opts.jsonStrict === true;
   const verbose = opts.verbose === true;
@@ -431,7 +456,7 @@ export function resolveGlobalFlags(command: Command, config: ResolvedAcpxConfig)
     jsonStrict,
     suppressReads: opts.suppressReads === true,
     fs: resolveCapabilityOption(opts.fs),
-    terminal: resolveTerminalOption(opts.terminal),
+    terminal: resolveCapabilityOption(opts.terminal),
     timeout: resolveTimeoutOption(opts.timeout, config),
     ttl: resolveTtlOption(opts.ttl, config),
     verbose,
@@ -479,10 +504,6 @@ function resolvePermissionPolicyOption(opts: Record<string, unknown>): string | 
 
 function resolveCapabilityOption(value: unknown): boolean | undefined {
   return value === false ? false : undefined;
-}
-
-function resolveTerminalOption(value: unknown): boolean | undefined {
-  return resolveCapabilityOption(value);
 }
 
 function resolveTimeoutOption(value: unknown, config: ResolvedAcpxConfig): number | undefined {

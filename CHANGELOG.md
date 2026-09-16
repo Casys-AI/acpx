@@ -8,11 +8,95 @@ Repo: https://github.com/openclaw/acpx
 
 ### Changes
 
+- Runtime/model selection: expose a model setter that uses the adapter's advertised control and preserves the selected model across reconnects.
+
 ### Breaking
 
 ### Fixes
 
+- Sessions/hardening: keep session records and indexes private across atomic rewrites, including embedded file stores.
+- ACP/filesystem: return the standard resource-not-found error for missing files so agents can distinguish new files from failed reads.
+- Filesystem/hardening: use fs-safe roots for ACP file operations and replay-viewer reads, rejecting outside symlinks and special files while preserving contained aliases, normal file modes, and large reads.
+- Viewer/startup: release server resources when the HTTP port is unavailable and avoid opening an unused Vite WebSocket listener.
+- Storage/hardening: share private atomic writes across sessions, flow bundles, imports, and exports; keep history and new config files private while preserving output-directory permissions and append ordering.
+- Queue/hardening: deliver detached-owner startup options through stdin instead of temporary credential-bearing files, preserving large payloads and startup diagnostics.
+- Queue/ownership: keep lease records private and complete during heartbeat updates, drain pending writes before shutdown, and preserve replacement owners during stale recovery.
+- Sessions: preserve both completions when flows and CLI prompts share a session; keep live writers protected and cancel waiting turns without starting delayed prompts.
+- Replay viewer: reject malformed HTTP/WebSocket input and corrupt bundle metadata without terminating the server; recover live updates after transient read failures.
+- CLI/hardening: preserve Unicode across piped prompt chunks and keep optional performance captures private without blocking on special-file targets.
 - ACP/process lifecycle: retain the native macOS/Linux bridge-tree lifeline for abrupt queue-owner death while loading it only from the installed package, validating its host manifest and digest, and failing closed unless its pipe handshake is armed. Cooperative shutdown still reaps the process group before releasing the lifeline.
+
+## 0.16.0 - 2026-09-15
+
+**Highlights:** Embedding hosts can share session-specific tools and turn-owned approvals, recover stored handles, and shut down connections while preserving existing sessions.
+
+### Changes
+
+- Runtime/embedding: surface normalized ACP plan entries on status events and explicit empty snapshots that clear stale plans. Thanks @gadzan.
+- Dependencies: update Zod, React and its types, Vite, and lint-staged; retain the 48-hour release-age policy.
+- Dependencies: refresh Node types, Oxfmt, and Oxlint; align source builds and CI with pnpm 11.26.0. Thanks @dependabot.
+- Source builds: document Node 22.22.1 as the minimum Node 22 development version required by lint-staged; published CLI installs still support Node 22.13 and newer.
+
+- Dependencies: refresh Zod, tsx, React Flow, Oxlint, the Pi and Claude adapters, and transitive tooling dependencies while retaining the 48-hour release-age policy.
+- Runtime/embedding: support session-specific tool servers, turn-owned permission callbacks, session handle lookup, and shutdown that waits for owned connections and cleanup.
+
+### Breaking
+
+### Fixes
+
+- Model selection: prefer the actual model control when an adapter also groups provider controls under the model category, while retaining custom model controls and legacy fallback. Thanks @wtfsayo.
+- Replay viewer: preserve user-message identities across repeated transcript projection so idle polling does not emit spurious patches.
+- Tooling: prevent malformed TOML configuration from hanging documentation lint by overriding the vulnerable `smol-toml` pin with 1.7.2 (GHSA-7w5x-hrqm-74c2).
+- ACP/cancellation: coalesce repeated prompt cancellation, allow explicit retries after failed sends, and preserve successor prompt ownership when abort callbacks reenter the client.
+- Sessions/export: preserve large event segments without exceeding the JavaScript argument limit.
+
+## 0.15.1 - 2026-09-07
+
+**Highlights:** Hosts can bound terminal output retention without changing existing defaults; incoming ACP messages now default to a 64 MiB limit with an explicit override.
+
+- ACP/terminal: add an opt-in `ACPX_TERMINAL_MAX_OUTPUT_BYTES` ceiling for combined stdout and stderr retention, preserving agent-requested limits and the 64 KiB default unless configured. Zero disables only the host ceiling; truncated output retains the newest UTF-8 suffix. Thanks @SebTardif.
+- ACP/transport (**compatibility change**): default incoming messages to a 64 MiB raw-byte limit instead of unlimited input; use `ACPX_MAX_ACP_MESSAGE_BYTES` to raise the limit or `0` to disable it. Overflow errors explain the override, and existing warm owners retain their startup setting.
+
+## 0.15.0 - 2026-09-07
+
+**Highlights:** Embedding hosts gain process lifecycle admission and transient child environments; optional limits bound shell output and ACP/queue input.
+
+- Runtime/embedding: expose optional correlated process lifecycle hooks with awaited launch admission and best-effort failure and exit observers. Thanks @MertBasar0.
+- Runtime/embedding: add a snapshotted child-only environment overlay for probes and session reconnects without persisting host settings or overriding protected authentication. Thanks @taras and @coding-ax.
+- ACP/results: preserve optional opaque prompt-response metadata in direct, queued, compare, and embedded-runtime results. Thanks @superbiche.
+- Agents/built-ins: add MiniMax Code through its native `mcode acp` server, with structured launch arguments and setup/lifecycle guidance. Thanks @hetaoBackend.
+- Flows: add optional per-stream shell capture limits with UTF-8 byte accounting and complete process-tree cleanup, retaining unlimited capture by default. Thanks @SebTardif.
+- ACP/transport: add an optional raw-byte message limit with clear overflow errors, preserving unlimited input by default and consistent handling across chunk boundaries. Thanks @SebTardif.
+- Queue: add an optional incoming request limit with client-side size diagnostics and raw-peer rejection, preserving large requests by default. Thanks @SebTardif.
+
+## 0.14.0 - 2026-09-05
+
+**Highlights:** One-shot runs can apply ACP configuration options before prompting, and embedded clients can wait for the actual prompt transport write.
+
+- CLI/exec: apply repeatable ACP `--config-option <key=value>` selections after the requested model and before a one-shot prompt. Thanks @superbiche.
+- Runtime/embedding: settle `promptStarted` only after the exact prompt request is accepted by the writable ACP transport, and reject it when that write fails. Thanks @vincentkoc.
+- Flows: preserve unlimited shell timeouts while enclosing deadlines and interrupts cancel active shell commands and attributable descendants before completing, and prevent late executors from launching after cancellation. Thanks @SebTardif.
+- ACP/terminal: time out hung Windows `taskkill` and report incomplete cleanup instead of hanging release or reporting a successful kill, retaining terminal state for a cleanup retry. Thanks @SebTardif.
+- Runtime/sessions: preserve uppercase and mixed-case environment variable names when saving and reloading session options. Thanks @coding-ax.
+- Flows: keep the host alive when a shell action closes stdin before consuming its input. Thanks @SebTardif.
+- ACP/terminal: handle child stdout and stderr errors without terminating the host, so wait and release can finish. Thanks @SebTardif.
+- ACP/launch: preserve process-spawn `ENOENT` as additive `AGENT_SPAWN_ENOENT` detail and include qualified remediation while keeping the broad runtime code and other spawn failures unchanged. Fixes #510. Thanks @anyech.
+- Flows: coalesce heartbeat writes while storage is busy so slow filesystems do not accumulate overlapping writes and stall running steps.
+- Dependencies: refresh tsx, zod, qs, replay-viewer packages, React DOM types, and source tooling; align source builds with pnpm 11.25.0 and tsdown 0.23.0. Thanks @dependabot.
+- Source builds: document supported Node versions separately from the published CLI runtime minimum; tsdown no longer supports Node 25.
+
+## 2026.8.28 (v0.13.2)
+
+### Changes
+
+- Dependencies: update the ACP SDK, TypeScript runner, replay-viewer dependencies, and validation tooling, and refresh transitive dependency overrides.
+
+### Breaking
+
+### Fixes
+
+- Docs/JSON: fix raw ACP tool-call pipelines and message examples so automation reads nested session updates and handles partial tool updates. Fixes #520. Thanks @prateek.
+- Session controls: restore saved model/config selections after reconnect, keep reasoning effort aligned with accepted model changes, and return accepted configuration to embedded clients without pinning unselected defaults. Thanks @programmerlapar.
 
 ## 2026.8.18 (v0.13.1)
 

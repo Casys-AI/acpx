@@ -33,6 +33,7 @@ Core capabilities:
 - Stable ACP client methods for filesystem and terminal requests
 - Stable ACP `authenticate` handshake via env/config credentials
 - Structured streaming output (`text`, `json`, `quiet`) with optional `--suppress-reads`
+- Prompt-response `_meta` preservation across direct, queued, compare, and embedded-runtime results
 - Built-in agent registry plus raw `--agent` escape hatch
 - Claude system prompt override via `--system-prompt` / `--append-system-prompt`
 - Optional ACP filesystem and terminal capability opt-outs via `--no-fs` and `--no-terminal`
@@ -81,10 +82,10 @@ If prompt text is omitted and stdin is piped, `acpx` reads prompt text from stdi
 
 Friendly agent names resolve to commands:
 
-- `pi` -> `npx pi-acp`
+- `pi` -> `npx pi-acp` (ACPX-owned package range; see `agents/Pi.md`)
 - `openclaw` -> `openclaw acp`
 - `codex` -> `npx -y @agentclientprotocol/codex-acp` (ACPX-owned package range)
-- `claude` -> `npx -y @agentclientprotocol/claude-agent-acp` (ACPX-owned package range)
+- `claude` -> `npx -y @agentclientprotocol/claude-agent-acp` (ACPX-owned package range; see `agents/Claude.md`)
 - `gemini` -> `gemini --acp`
 - `cursor` -> `cursor-agent acp`
 - `copilot` -> `copilot --acp --stdio`
@@ -95,6 +96,7 @@ Friendly agent names resolve to commands:
 - `kilocode` -> `npx -y @kilocode/cli acp`
 - `kimi` -> `kimi acp`
 - `kiro` -> `kiro-cli-chat acp`
+- `mcode` -> `mcode acp` (install/authenticate MCode first; prefer `exec` for one-shot work, and require advertised ACP reload support for cross-invocation continuity)
 - `mux` -> `mux acp` via an ACPX-owned npm range
 - `opencode` -> `npx -y opencode-ai acp`
 - `pool` -> `pool acp`
@@ -147,11 +149,14 @@ Prompt options:
 ```bash
 acpx exec 'summarize this repo'
 acpx codex exec 'summarize this repo'
+acpx --model gpt-5.6-sol codex exec --config-option reasoning_effort=xhigh 'review this repo'
 ```
 
 Behavior:
 
 - Runs a single prompt in a temporary ACP session
+- Applies `--model`, then repeatable `--config-option <key=value>` selections, before prompting
+- Fails before the prompt if the adapter rejects a requested config option
 - Does not reuse or save persistent session state
 
 ### Compare (multi-agent one-shot)
@@ -189,6 +194,8 @@ Behavior:
 - Current codex-acp releases expose `model` and `reasoning_effort` as separate config options.
 - `--model <id>`: Claude-compatible adapters may consume session creation metadata; other agents must advertise a model config option or legacy `models` metadata.
 - `set model <id>`: uses `session/set_config_option` for advertised model config options and preserves `session/set_model` for explicitly advertised legacy models.
+- Model switches can change or remove reasoning-effort controls. ACPX reconciles saved non-mode selections with the accepted response; select a supported effort again if needed.
+- After reconnect, ACPX restores the saved model when advertised and replays saved config selections before prompting. A replay failure is reported instead of silently using defaults.
 - `set-mode`/`set` route through queue-owner IPC when active, otherwise reconnect directly.
 
 ### Sessions
@@ -422,7 +429,9 @@ Example automation:
 
 ```bash
 acpx --format json codex exec 'review changed files' \
-  | jq -r 'select(.type=="tool_call") | [.status, .title] | @tsv'
+  | jq -r 'select(.method=="session/update") | .params.update
+           | select(.sessionUpdate=="tool_call" or .sessionUpdate=="tool_call_update")
+           | [(.status // "-"), (.title // "-")] | @tsv'
 ```
 
 ## Permission modes

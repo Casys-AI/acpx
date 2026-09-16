@@ -163,7 +163,13 @@ function logDeferredCancelFailure(error: unknown, verbose?: boolean): void {
 }
 
 function queueOwnerExitIsFatal(exit: QueueOwnerProcessExitState): boolean {
-  return exit.exited && (exit.spawnError !== undefined || exit.code !== 0 || exit.signal !== null);
+  return (
+    exit.exited &&
+    (exit.spawnError !== undefined ||
+      exit.inputError !== undefined ||
+      exit.code !== 0 ||
+      exit.signal !== null)
+  );
 }
 
 function logQueueOwnerReady(params: {
@@ -181,17 +187,12 @@ function logQueueOwnerReady(params: {
 }
 
 async function closeQueueOwnerRuntime(params: {
-  lease: QueueOwnerLease;
   owner: SessionQueueOwner | undefined;
-  heartbeatTimer: NodeJS.Timeout | undefined;
   turnController: QueueOwnerTurnController;
   sharedClient: AcpClient;
   sessionId: string;
   verbose?: boolean;
 }): Promise<void> {
-  if (params.heartbeatTimer) {
-    clearInterval(params.heartbeatTimer);
-  }
   params.turnController.beginClosing();
   // Kill the bridge before draining IPC so it cannot outlive the owner.
   await params.sharedClient.close().catch(() => {
@@ -199,7 +200,6 @@ async function closeQueueOwnerRuntime(params: {
   });
   await params.owner?.close();
   await writeQueueOwnerLifecycleSnapshot(params.sessionId, params.sharedClient);
-  await releaseQueueOwnerLease(params.lease);
   if (params.verbose) {
     process.stderr.write(`[acpx] queue owner stopped for session ${params.sessionId}\n`);
   }
@@ -247,7 +247,6 @@ type QueueOwnerShutdownController = {
 };
 
 function createQueueOwnerShutdownController(params: {
-  lease: QueueOwnerLease;
   getOwner: () => SessionQueueOwner | undefined;
   stopHeartbeat: () => void;
   turnController: QueueOwnerTurnController;
@@ -309,9 +308,7 @@ function createQueueOwnerShutdownController(params: {
       shutdownPromise ??= (async () => {
         await activeTurnShutdown;
         await closeQueueOwnerRuntime({
-          lease: params.lease,
           owner: params.getOwner(),
-          heartbeatTimer: undefined,
           turnController: params.turnController,
           sharedClient: params.sharedClient,
           sessionId: params.sessionId,
@@ -357,7 +354,17 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
   if (!lease) {
     return;
   }
+  try {
+    await runQueueOwnerRuntime(options, lease);
+  } finally {
+    await releaseQueueOwnerLease(lease);
+  }
+}
 
+async function runQueueOwnerRuntime(
+  options: QueueOwnerRuntimeOptions,
+  lease: QueueOwnerLease,
+): Promise<void> {
   const sessionRecord = await resolveSessionRecord(options.sessionId);
   let owner: SessionQueueOwner | undefined;
   let heartbeatTimer: NodeJS.Timeout | undefined;
@@ -397,17 +404,16 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
     return true;
   };
 
-  const runPromptTurn = async <T>(run: () => Promise<T>): Promise<T> => {
-    turnController.beginTurn();
+  const runPromptTurn = async <T>(run: (waitSignal: AbortSignal) => Promise<T>): Promise<T> => {
+    const waitSignal = turnController.beginTurn();
     try {
-      return await run();
+      return await run(waitSignal);
     } finally {
       turnController.endTurn();
     }
   };
 
   const shutdown = createQueueOwnerShutdownController({
-    lease,
     getOwner: () => owner,
     stopHeartbeat: () => {
       if (heartbeatTimer) {
@@ -487,7 +493,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
       }
       isFirstTask = false;
 
-      const turnPromise = runPromptTurn(async () => {
+      const turnPromise = runPromptTurn(async (waitSignal) => {
         try {
           await runQueuedTask(options.sessionId, task, {
             sharedClient,
@@ -506,6 +512,7 @@ export async function runSessionQueueOwner(options: QueueOwnerRuntimeOptions): P
               await applyPendingCancel();
             },
             handleProcessInterrupts: false,
+            waitSignal,
           });
         } finally {
           checkpointPerfMetricsCapture();

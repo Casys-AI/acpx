@@ -18,6 +18,8 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { isProcessAlive } from "../src/cli/queue/lease-store.js";
 import { queueLockFilePath, queueSocketPath } from "../src/cli/queue/paths.js";
+import { runSessionQueueOwner } from "../src/cli/session/queue-owner-runtime.js";
+import { extractAgentMessageChunkText } from "./jsonrpc-test-helpers.js";
 import { makeSessionRecord, withTempHome, writeSessionRecordFile } from "./runtime-test-helpers.js";
 
 const CLI_PATH = fileURLToPath(new URL("../src/cli.js", import.meta.url));
@@ -47,8 +49,48 @@ async function waitUntil(
   throw new Error(`Condition not met within ${timeoutMs}ms`);
 }
 
-async function waitForTerminalQueueMessage(
+async function connectQueueSocket(socketPath: string): Promise<net.Socket> {
+  let connectedSocket: net.Socket | undefined;
+  // A Unix socket file can exist before the server starts accepting connections.
+  await waitUntil(
+    () =>
+      new Promise<boolean>((resolve, reject) => {
+        const socket = net.createConnection(socketPath);
+        socket.setEncoding("utf8");
+        socket.once("connect", () => {
+          connectedSocket = socket;
+          resolve(true);
+        });
+        socket.once("error", (error: NodeJS.ErrnoException) => {
+          socket.destroy();
+          if (error.code === "ENOENT" || error.code === "ECONNREFUSED") {
+            resolve(false);
+          } else {
+            reject(error);
+          }
+        });
+      }),
+  );
+  assert(connectedSocket, "queue socket must be connected");
+  return connectedSocket;
+}
+
+async function waitForBridgePid(pidFilePath: string): Promise<number> {
+  let bridgePid = 0;
+  // File creation precedes the PID write, so existence alone is not readiness.
+  await waitUntil(async () => {
+    if (!(await fileExists(pidFilePath))) {
+      return false;
+    }
+    bridgePid = Number((await fs.readFile(pidFilePath, "utf8")).trim());
+    return Number.isInteger(bridgePid) && bridgePid > 0;
+  }, 8_000);
+  return bridgePid;
+}
+
+async function waitForQueueMessage(
   iterator: AsyncIterator<string>,
+  matches: (message: Record<string, unknown>) => boolean,
   timeoutMs = 5_000,
 ): Promise<Record<string, unknown>> {
   const deadline = Date.now() + timeoutMs;
@@ -59,25 +101,26 @@ async function waitForTerminalQueueMessage(
         iterator.next(),
         new Promise<never>((_, reject) => {
           timer = setTimeout(
-            () => reject(new Error("timeout waiting for queue result")),
-            timeoutMs,
+            () => reject(new Error("timeout waiting for queue message")),
+            Math.max(1, deadline - Date.now()),
           );
         }),
       ]);
       if (line.done) {
-        throw new Error("queue socket closed before terminal result");
+        throw new Error("queue socket closed before expected message");
       }
       const message = JSON.parse(line.value) as Record<string, unknown>;
-      if (message.type === "result" || message.type === "error") {
+      if (matches(message)) {
         return message;
       }
+      assert.notEqual(message.type, "error", JSON.stringify(message));
     } finally {
       if (timer) {
         clearTimeout(timer);
       }
     }
   }
-  throw new Error(`Queue result not received within ${timeoutMs}ms`);
+  throw new Error(`Queue message not received within ${timeoutMs}ms`);
 }
 
 function waitForProcessExit(
@@ -97,6 +140,14 @@ function waitForProcessExit(
 }
 
 describe("queue owner lifecycle — graceful SIGTERM shutdown", () => {
+  it("releases its lease when session setup fails before the socket starts", async () => {
+    await withTempHome("acpx-lifecycle-setup-", async (homeDir) => {
+      const sessionId = "missing-owner-session";
+      await assert.rejects(runSessionQueueOwner({ sessionId, permissionMode: "approve-reads" }));
+      assert.equal(await fileExists(queueLockFilePath(sessionId, homeDir)), false);
+    });
+  });
+
   it("exits with code 0 and releases its lease when it receives SIGTERM", async () => {
     if (process.platform === "win32") {
       // SIGTERM semantics differ on Windows; skip this test.
@@ -130,13 +181,10 @@ describe("queue owner lifecycle — graceful SIGTERM shutdown", () => {
       });
 
       const child = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
-        env: {
-          ...process.env,
-          HOME: homeDir,
-          ACPX_QUEUE_OWNER_PAYLOAD: payload,
-        },
-        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["pipe", "ignore", "pipe"],
       });
+      child.stdin.end(payload);
 
       const stderrChunks: Buffer[] = [];
       child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
@@ -204,13 +252,10 @@ describe("queue owner lifecycle — graceful SIGTERM shutdown", () => {
       });
 
       const child = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
-        env: {
-          ...process.env,
-          HOME: homeDir,
-          ACPX_QUEUE_OWNER_PAYLOAD: payload,
-        },
-        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["pipe", "ignore", "pipe"],
       });
+      child.stdin.end(payload);
 
       const stderrChunks: Buffer[] = [];
       child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
@@ -263,28 +308,22 @@ describe("queue owner lifecycle — graceful SIGTERM shutdown", () => {
 
       const socketPath = queueSocketPath(record.acpxRecordId, homeDir);
       const lockPath = queueLockFilePath(record.acpxRecordId, homeDir);
-      const child = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
-        env: {
-          ...process.env,
-          HOME: homeDir,
-          ACPX_QUEUE_OWNER_PAYLOAD: JSON.stringify({
-            sessionId: record.acpxRecordId,
-            permissionMode: "approve-reads",
-          }),
-        },
-        stdio: ["ignore", "ignore", "pipe"],
+      const payload = JSON.stringify({
+        sessionId: record.acpxRecordId,
+        permissionMode: "approve-reads",
       });
+      const child = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      child.stdin.end(payload);
       const stderrChunks: Buffer[] = [];
       child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
       let idleSocket: net.Socket | undefined;
 
       try {
         await waitUntil(() => fileExists(socketPath));
-        idleSocket = await new Promise<net.Socket>((resolve, reject) => {
-          const socket = net.createConnection(socketPath);
-          socket.once("connect", () => resolve(socket));
-          socket.once("error", reject);
-        });
+        idleSocket = await connectQueueSocket(socketPath);
 
         child.kill("SIGTERM");
         const { code, signal } = await waitForProcessExit(child, 5_000);
@@ -342,13 +381,10 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
       });
 
       const child = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
-        env: {
-          ...process.env,
-          HOME: homeDir,
-          ACPX_QUEUE_OWNER_PAYLOAD: payload,
-        },
-        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["pipe", "ignore", "pipe"],
       });
+      child.stdin.end(payload);
 
       const stderrChunks: Buffer[] = [];
       child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
@@ -362,12 +398,7 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
         // Connect to the queue-owner socket and submit a long-running prompt.
         // "sleep 10000" keeps the bridge busy for 10 s so it is still alive
         // when we send SIGTERM to the queue owner.
-        queueSocket = await new Promise<net.Socket>((resolve, reject) => {
-          const s = net.createConnection(socketPath);
-          s.setEncoding("utf8");
-          s.once("connect", () => resolve(s));
-          s.once("error", reject);
-        });
+        queueSocket = await connectQueueSocket(socketPath);
 
         queueSocket.write(
           `${JSON.stringify({
@@ -404,10 +435,7 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
 
         // Wait for the bridge to write its PID — this confirms the bridge
         // process has been spawned and the ACP handshake has started.
-        await waitUntil(() => fileExists(pidFilePath), 8_000);
-
-        const bridgePidRaw = (await fs.readFile(pidFilePath, "utf8")).trim();
-        const bridgePid = Number(bridgePidRaw);
+        const bridgePid = await waitForBridgePid(pidFilePath);
         assert(
           Number.isInteger(bridgePid) && bridgePid > 0,
           "bridge PID must be a positive integer",
@@ -483,13 +511,10 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
       });
 
       const child = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
-        env: {
-          ...process.env,
-          HOME: homeDir,
-          ACPX_QUEUE_OWNER_PAYLOAD: payload,
-        },
-        stdio: ["ignore", "ignore", "pipe"],
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["pipe", "ignore", "pipe"],
       });
+      child.stdin.end(payload);
 
       const stderrChunks: Buffer[] = [];
       child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
@@ -501,18 +526,13 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
       try {
         await waitUntil(() => fileExists(socketPath));
 
-        queueSocket = await new Promise<net.Socket>((resolve, reject) => {
-          const s = net.createConnection(socketPath);
-          s.setEncoding("utf8");
-          s.once("connect", () => resolve(s));
-          s.once("error", reject);
-        });
+        queueSocket = await connectQueueSocket(socketPath);
 
         queueSocket.write(
           `${JSON.stringify({
             type: "submit_prompt",
             requestId: "req-open-socket-test",
-            message: "sleep 10000",
+            message: "stream-sleep 10000 prompt-ready",
             permissionMode: "approve-reads",
             waitForCompletion: true,
           })}\n`,
@@ -537,15 +557,21 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
         // the bridge kill or prevent the owner from exiting within the grace period.
 
         // Wait until the bridge has written its PID — ACP handshake started.
-        await waitUntil(() => fileExists(pidFilePath), 8_000);
-
-        const bridgePidRaw = (await fs.readFile(pidFilePath, "utf8")).trim();
-        const bridgePid = Number(bridgePidRaw);
+        const bridgePid = await waitForBridgePid(pidFilePath);
         assert(
           Number.isInteger(bridgePid) && bridgePid > 0,
           "bridge PID must be a positive integer",
         );
         assert.equal(isProcessAlive(bridgePid), true, "bridge must be alive before SIGTERM");
+
+        // A PID only proves process startup, not an active ACP prompt.
+        await waitForQueueMessage(
+          iter,
+          (message) =>
+            message.type === "event" &&
+            extractAgentMessageChunkText(message.message as Record<string, unknown>) ===
+              "prompt-ready",
+        );
 
         // Delay session/cancel in the mock so the lease-retention assertion is
         // deterministic while the active turn is still unwinding.
@@ -559,8 +585,11 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
           "lease must remain held until active turn cancellation completes",
         );
 
-        const terminalMessage = await waitForTerminalQueueMessage(iter, 5_000);
-        assert.equal(terminalMessage.type, "result");
+        const terminalMessage = await waitForQueueMessage(
+          iter,
+          (message) => message.type === "result" || message.type === "error",
+        );
+        assert.equal(terminalMessage.type, "result", JSON.stringify(terminalMessage));
         const clientResult = terminalMessage.result as { stopReason?: unknown };
         assert.equal(clientResult.stopReason, "cancelled");
 
@@ -615,8 +644,12 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
 });
 
 describe("queue owner lifecycle — abrupt owner death", () => {
-  it("reaps the bridge tree after repeated armed owners receive SIGKILL", async () => {
+  it("reaps the bridge tree after repeated armed owners receive SIGKILL", async (t) => {
     if (process.platform !== "darwin" && process.platform !== "linux") {
+      return;
+    }
+    if (!canEnumerateProcesses()) {
+      t.skip("process enumeration (ps) is unavailable; lifeline-PID discovery cannot run here");
       return;
     }
 
@@ -651,17 +684,15 @@ describe("queue owner lifecycle — abrupt owner death", () => {
         await writeSessionRecordFile(homeDir, record);
 
         const socketPath = queueSocketPath(record.acpxRecordId, homeDir);
-        const owner = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
-          env: {
-            ...process.env,
-            HOME: homeDir,
-            ACPX_QUEUE_OWNER_PAYLOAD: JSON.stringify({
-              sessionId: record.acpxRecordId,
-              permissionMode: "approve-reads",
-            }),
-          },
-          stdio: ["ignore", "ignore", "pipe"],
+        const payload = JSON.stringify({
+          sessionId: record.acpxRecordId,
+          permissionMode: "approve-reads",
         });
+        const owner = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
+          env: { ...process.env, HOME: homeDir },
+          stdio: ["pipe", "ignore", "pipe"],
+        });
+        owner.stdin.end(payload);
         const stderrChunks: Buffer[] = [];
         owner.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
         let queueSocket: net.Socket | undefined;
@@ -755,6 +786,18 @@ async function readPositivePid(filePath: string): Promise<number> {
   const pid = Number((await fs.readFile(filePath, "utf8")).trim());
   assert(Number.isInteger(pid) && pid > 1, `invalid PID in ${filePath}`);
   return pid;
+}
+
+function canEnumerateProcesses(): boolean {
+  try {
+    execFileSync("ps", ["-o", "pid=", "-p", String(process.pid)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function findLifelinePid(bridgePid: number): number | undefined {

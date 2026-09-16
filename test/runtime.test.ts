@@ -136,7 +136,7 @@ test("AcpxRuntime delegates session lifecycle to the runtime manager", async () 
       acpxRecordId: record.acpxRecordId,
     }),
     setMode: async () => {},
-    setConfigOption: async () => {},
+    setConfigOption: async () => ({ configOptions: [] }),
     cancel: async () => {
       managerCancelCalls += 1;
     },
@@ -214,7 +214,9 @@ test("AcpxRuntime delegates session lifecycle to the runtime manager", async () 
 
   await runtime.getStatus({ handle });
   await runtime.setMode({ handle, mode: "architect" });
-  await runtime.setConfigOption({ handle, key: "approval", value: "manual" });
+  assert.deepEqual(await runtime.setConfigOption({ handle, key: "approval", value: "manual" }), {
+    configOptions: [],
+  });
   await runtime.cancel({ handle, reason: "legacy cancel" });
   await turn.closeStream({ reason: "observer closed stream" });
   await turn.cancel();
@@ -350,7 +352,74 @@ test("createFileSessionStore persists records inside the provided state director
   );
 });
 
-test("createFileSessionStore supports concurrent saves in the same millisecond", async (t) => {
+test("createFileSessionStore preserves environment name casing across reloads", async (t) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-env-store-"));
+  t.after(async () => {
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+  const env = { INITIAL_AGENT_MODE: "read-only", CustomMixedCase: "synthetic" };
+  const record = createSessionRecord({ acpx: { session_options: { env } } });
+
+  await createFileSessionStore({ stateDir }).save(record);
+
+  const restored = await createFileSessionStore({ stateDir }).load(record.acpxRecordId);
+  assert.deepEqual(restored?.acpx?.session_options?.env, env);
+});
+
+for (const [scenario, existingFileMode, existingDirMode] of [
+  ["new records", undefined, undefined],
+  ["private rewrites", 0o600, 0o700],
+  ["legacy shared rewrites", 0o664, 0o775],
+  ["symlinked session directories", undefined, undefined],
+] as const) {
+  test(
+    `createFileSessionStore keeps ${scenario} private under a permissive umask`,
+    { skip: process.platform === "win32" },
+    async (t) => {
+      const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-store-private-"));
+      t.after(async () => {
+        await fs.rm(stateDir, { recursive: true, force: true });
+      });
+      const previousUmask = process.umask(0o002);
+      try {
+        const store = createFileSessionStore({ stateDir });
+        const record = createSessionRecord({ title: "before" });
+        const sessionDir = path.join(stateDir, "sessions");
+        const recordPath = path.join(sessionDir, `${encodeURIComponent(record.acpxRecordId)}.json`);
+        const symlinkTarget = path.join(stateDir, "session-target");
+
+        if (scenario === "symlinked session directories") {
+          await fs.mkdir(symlinkTarget, { mode: 0o775 });
+          await fs.symlink(symlinkTarget, sessionDir, "dir");
+        }
+
+        if (existingFileMode !== undefined && existingDirMode !== undefined) {
+          await store.save(record);
+          await fs.chmod(recordPath, existingFileMode);
+          await fs.chmod(sessionDir, existingDirMode);
+        }
+
+        record.title = "after";
+        record.messages = [{ Agent: { content: [{ Text: "saved reply" }], tool_results: {} } }];
+        await store.save(record);
+
+        assert.equal((await fs.stat(recordPath)).mode & 0o777, 0o600, "session record mode");
+        assert.equal((await fs.stat(sessionDir)).mode & 0o777, 0o700, "session directory mode");
+        if (scenario === "symlinked session directories") {
+          assert.equal(await fs.readlink(sessionDir), symlinkTarget);
+          assert.equal((await fs.stat(symlinkTarget)).mode & 0o777, 0o700, "symlink target mode");
+        }
+        const restored = await createFileSessionStore({ stateDir }).load(record.acpxRecordId);
+        assert.equal(restored?.title, "after");
+        assert.deepEqual(restored?.messages, record.messages);
+      } finally {
+        process.umask(previousUmask);
+      }
+    },
+  );
+}
+
+test("createFileSessionStore supports concurrent saves with long session IDs in the same millisecond", async (t) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-store-concurrent-"));
   t.after(async () => {
     await fs.rm(stateDir, { recursive: true, force: true });
@@ -364,7 +433,7 @@ test("createFileSessionStore supports concurrent saves in the same millisecond",
 
   const store = createFileSessionStore({ stateDir });
   const record = createSessionRecord({
-    acpxRecordId: "agent:codex:acp:concurrent",
+    acpxRecordId: "x".repeat(220),
     acpSessionId: "sid-concurrent",
   });
 
@@ -372,10 +441,9 @@ test("createFileSessionStore supports concurrent saves in the same millisecond",
 
   const loaded = await store.load(record.acpxRecordId);
   assert.equal(loaded?.acpSessionId, "sid-concurrent");
-  assert.deepEqual(
-    (await fs.readdir(path.join(stateDir, "sessions"))).filter((file) => file.endsWith(".tmp")),
-    [],
-  );
+  assert.deepEqual(await fs.readdir(path.join(stateDir, "sessions")), [
+    `${record.acpxRecordId}.json`,
+  ]);
 });
 
 test("createFileSessionStore.load() returns undefined for a corrupt session file (#378)", async (t) => {
@@ -587,7 +655,12 @@ test("AcpxRuntime falls back to plain runtimeSessionName handles and reuses a si
   await runtime.probeAvailability();
   assert.equal(runtime.isHealthy(), true);
   assert.deepEqual(await runtime.getCapabilities(), {
-    controls: ["session/set_mode", "session/set_config_option", "session/status"],
+    controls: [
+      "session/set_mode",
+      "session/set_model",
+      "session/set_config_option",
+      "session/status",
+    ],
   });
 
   const plainHandle = {
@@ -673,7 +746,12 @@ test("AcpxRuntime exposes advertised config option keys for resolved handles", a
       },
     }),
     {
-      controls: ["session/set_mode", "session/set_config_option", "session/status"],
+      controls: [
+        "session/set_mode",
+        "session/set_model",
+        "session/set_config_option",
+        "session/status",
+      ],
       configOptionKeys: ["mode", "model"],
     },
   );
@@ -695,3 +773,155 @@ test("createRuntimeStore is an alias for the file-backed session store", async (
 
   assert.equal(loaded?.acpSessionId, "alias-sid");
 });
+
+test("AcpxRuntime snapshots transient child environment for manager and probes", async () => {
+  const agentProcessEnv = { ACPX_TEST_RUNTIME_OVERLAY: "construction-value" };
+  const observed: unknown[] = [];
+  const runtime = new AcpxRuntime(
+    {
+      cwd: process.cwd(),
+      sessionStore: createFileSessionStore({
+        stateDir: path.join(os.tmpdir(), "unused-env-store"),
+      }),
+      agentRegistry: createAgentRegistry(),
+      permissionMode: "deny-all",
+      agentProcessEnv,
+    },
+    {
+      probeRunner: async (options) => {
+        observed.push(options.agentProcessEnv);
+        return { ok: true, message: "synthetic probe" };
+      },
+    },
+  );
+  agentProcessEnv.ACPX_TEST_RUNTIME_OVERLAY = "mutated-value";
+  await runtime.doctor();
+  assert.deepEqual(observed, [{ ACPX_TEST_RUNTIME_OVERLAY: "construction-value" }]);
+  assert.equal(process.env.ACPX_TEST_RUNTIME_OVERLAY, undefined);
+});
+
+for (const control of [
+  { name: "config option", args: ["--model-config-id", "llm"], model: "fast-model" },
+  { name: "legacy models", args: ["--advertise-legacy-models"], model: "alternate-model" },
+]) {
+  test(`public model control persists ${control.name} through active turns and reconnect`, async (t) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-model-"));
+    const store = createFileSessionStore({ stateDir: path.join(cwd, "state") });
+    const options = {
+      cwd,
+      sessionStore: store,
+      agentRegistry: createAgentRegistry({
+        overrides: {
+          fixture: [process.execPath, MOCK_AGENT_PATH, "--supports-load-session", ...control.args],
+        },
+      }),
+      permissionMode: "approve-reads" as const,
+    };
+    let runtime = createAcpRuntime(options);
+    t.after(async () => {
+      await runtime.shutdown();
+      await fs.rm(cwd, { recursive: true, force: true });
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "models",
+      agent: "fixture",
+      mode: "persistent",
+    });
+    await runtime.setModel({ handle, model: control.model });
+    assert.equal((await runtime.getStatus({ handle })).models?.currentModelId, control.model);
+    const turn = runtime.startTurn({
+      handle,
+      text: "sleep 10000",
+      mode: "prompt",
+      requestId: "model-active",
+    });
+    const events = (async () => {
+      for await (const event of turn.events) {
+        void event;
+      }
+    })();
+    await turn.promptStarted;
+    await runtime.setModel({ handle, model: "default-model" });
+    assert.equal((await runtime.getStatus({ handle })).models?.currentModelId, "default-model");
+    await turn.cancel();
+    await events;
+    assert.equal((await turn.result).status, "cancelled");
+    await runtime.shutdown();
+    runtime = createAcpRuntime(options);
+    await runtime.setModel({ handle, model: control.model });
+    assert.equal((await runtime.getStatus({ handle })).models?.currentModelId, control.model);
+    const stored = await store.load(handle.acpxRecordId ?? handle.sessionKey);
+    assert.equal(stored?.acpx?.session_options?.model, control.model);
+    assert.equal(stored?.acpx?.current_model_id, control.model);
+    await runtime.shutdown();
+    runtime = createAcpRuntime(options);
+    const resumed = runtime.startTurn({
+      handle,
+      text: "echo resumed",
+      mode: "prompt",
+      requestId: "model-resumed",
+    });
+    for await (const event of resumed.events) {
+      void event;
+    }
+    assert.equal((await resumed.result).status, "completed");
+    assert.equal((await runtime.getStatus({ handle })).models?.currentModelId, control.model);
+  });
+
+  test(`public model control preserves saved selection after ${control.name} rejection`, async (t) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "acpx-runtime-model-reject-"));
+    const store = createFileSessionStore({ stateDir: path.join(cwd, "state") });
+    const runtime = createAcpRuntime({
+      cwd,
+      sessionStore: store,
+      agentRegistry: createAgentRegistry({
+        overrides: {
+          fixture: [
+            process.execPath,
+            MOCK_AGENT_PATH,
+            ...control.args,
+            "--set-session-model-fails",
+          ],
+        },
+      }),
+      permissionMode: "approve-reads",
+    });
+    t.after(async () => {
+      await runtime.shutdown();
+      await fs.rm(cwd, { recursive: true, force: true });
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "rejected-model",
+      agent: "fixture",
+      mode: "persistent",
+      sessionOptions: { model: "default-model" },
+    });
+    const before = await store.load(handle.acpxRecordId ?? handle.sessionKey);
+    await assert.rejects(
+      runtime.setModel({ handle, model: control.model }),
+      /setSessionModel failed/,
+    );
+    const turn = runtime.startTurn({
+      handle,
+      text: "sleep 10000",
+      mode: "prompt",
+      requestId: "rejected-active-model",
+    });
+    const events = (async () => {
+      for await (const event of turn.events) {
+        void event;
+      }
+    })();
+    await turn.promptStarted;
+    await assert.rejects(
+      runtime.setModel({ handle, model: control.model }),
+      /setSessionModel failed/,
+    );
+    await turn.cancel();
+    await events;
+    assert.equal((await turn.result).status, "cancelled");
+    const after = await store.load(handle.acpxRecordId ?? handle.sessionKey);
+    assert.equal(after?.acpx?.current_model_id, before?.acpx?.current_model_id);
+    assert.deepEqual(after?.acpx?.session_options, before?.acpx?.session_options);
+  });
+}

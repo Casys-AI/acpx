@@ -5,11 +5,7 @@ import {
   isRetryablePromptError,
   normalizeOutputError,
 } from "../../acp/error-normalization.js";
-import {
-  assertRequestedModelSupported,
-  modelStateFromConfigOptions,
-} from "../../acp/model-support.js";
-import { InterruptedError, withInterrupt, withTimeout } from "../../async-control.js";
+import { InterruptedError, TimeoutError, withInterrupt, withTimeout } from "../../async-control.js";
 export { InterruptedError, TimeoutError } from "../../async-control.js";
 import { formatPerfMetric, measurePerf, startPerfTimer } from "../../perf-metrics.js";
 import { textPrompt } from "../../prompt-content.js";
@@ -24,10 +20,7 @@ import {
   sessionOptionsFromRecord,
   type SessionAgentOptions,
 } from "../../runtime/engine/session-options.js";
-import {
-  applyConfigOptionsToRecord,
-  applyConfigOptionsToState,
-} from "../../session/config-options.js";
+import { applyConfigOptionSelection, applyModelSelection } from "../../session/config-options.js";
 import {
   cloneSessionAcpxState,
   cloneSessionConversation,
@@ -38,15 +31,7 @@ import {
 } from "../../session/conversation-model.js";
 import { SessionEventWriter } from "../../session/events.js";
 import { LiveSessionCheckpoint } from "../../session/live-checkpoint.js";
-import {
-  clearDesiredConfigOption,
-  setCurrentModelId,
-  setDesiredModelId,
-} from "../../session/mode-preference.js";
-import {
-  applyRequestedModelIfAdvertised,
-  currentModelIdFromSetModelResponse,
-} from "../../session/model-application.js";
+import { applyRequestedModelIfAdvertised } from "../../session/model-application.js";
 import { advertisedModelState } from "../../session/model-state.js";
 import {
   absolutePath,
@@ -54,6 +39,7 @@ import {
   resolveSessionRecord,
   writeSessionRecord,
 } from "../../session/persistence.js";
+import { acquireSessionTurn } from "../../session/turn-ownership.js";
 import type {
   AcpJsonRpcMessage,
   AcpMessageDirection,
@@ -83,6 +69,7 @@ type RunSessionPromptOptions = Omit<
   "maxQueueDepth" | "sessionId" | "ttlMs" | "waitForCompletion"
 > & {
   sessionRecordId: string;
+  waitSignal?: AbortSignal;
   handleProcessInterrupts?: boolean;
   onClientAvailable?: (controller: ActiveSessionController) => void;
   onClientClosed?: () => void;
@@ -234,28 +221,18 @@ function toPromptResult(
   stopReason: RunPromptResult["stopReason"],
   sessionId: string,
   client: AcpClient,
+  meta?: Record<string, unknown> | null,
 ): RunPromptResult {
   return {
     stopReason,
     sessionId,
     permissionStats: client.getPermissionStats(),
+    ...(meta === undefined ? {} : { _meta: meta }),
   };
 }
 
 function requestedModelId(value: string | undefined): string {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function applyConfigOptionResponseToState(
-  state: SessionAcpxState | undefined,
-  response:
-    | Awaited<ReturnType<AcpClient["setSessionConfigOption"]>>
-    | Awaited<ReturnType<AcpClient["setSessionModel"]>>,
-): SessionAcpxState | undefined {
-  if (!response?.configOptions) {
-    return state;
-  }
-  return applyConfigOptionsToState(state, response.configOptions);
 }
 
 export function mergeConnectedModelState(
@@ -309,6 +286,8 @@ function mergeConnectedModelPreferences(
   }
   if (connectedState.desired_config_options) {
     nextState.desired_config_options = { ...connectedState.desired_config_options };
+  } else {
+    delete nextState.desired_config_options;
   }
 }
 
@@ -325,34 +304,19 @@ async function applyPromptModelIfAdvertised(params: {
     return;
   }
 
-  const models = advertisedModelState(params.record.acpx);
-  const warning = assertRequestedModelSupported({
+  const result = await applyRequestedModelIfAdvertised({
+    client: params.client,
+    sessionId: params.sessionId,
     requestedModel,
-    models,
+    models: advertisedModelState(params.record.acpx),
     agentCommand: params.record.agentCommand,
-    context: "apply",
+    timeoutMs: params.timeoutMs,
+    onWarning: params.suppressWarnings
+      ? undefined
+      : (message) => process.stderr.write(`[acpx] warning: ${message}\n`),
   });
-  emitModelSupportWarning(warning, params.suppressWarnings);
-  if (!models) {
-    return;
-  }
-  if (params.record.acpx?.current_model_id === requestedModel) {
-    setDesiredModelId(params.record, requestedModel, models.configId);
-    return;
-  }
-
-  const response = await withTimeout(
-    params.client.setSessionModel(params.sessionId, requestedModel, models),
-    params.timeoutMs,
-  );
-  applyConfigOptionsToRecord(params.record, response);
-  setDesiredModelId(params.record, requestedModel, models.configId);
-  setCurrentModelId(params.record, currentModelIdFromSetModelResponse(response, requestedModel));
-}
-
-function emitModelSupportWarning(warning: string | undefined, suppressWarnings?: boolean): void {
-  if (warning && !suppressWarnings) {
-    process.stderr.write(`[acpx] warning: ${warning}\n`);
+  if (result.applied) {
+    params.record.acpx = applyModelSelection(params.record.acpx, requestedModel, result.response);
   }
 }
 
@@ -589,6 +553,7 @@ function buildQueuedTaskRunOptions(
     onClientClosed: options.onClientClosed,
     onPromptActive: options.onPromptActive,
     handleProcessInterrupts: options.handleProcessInterrupts,
+    waitSignal: options.waitSignal,
     client: options.sharedClient,
   };
 }
@@ -645,6 +610,7 @@ export async function runQueuedTask(
     onClientClosed?: () => void;
     onPromptActive?: () => Promise<void> | void;
     handleProcessInterrupts?: boolean;
+    waitSignal?: AbortSignal;
   },
 ): Promise<void> {
   const outputFormatter = task.waitForCompletion
@@ -666,7 +632,65 @@ export async function runQueuedTask(
   }
 }
 
+async function waitForSessionTurn(options: RunSessionPromptOptions): Promise<{
+  recordId: string;
+  ownership: AsyncDisposable;
+}> {
+  const waiting = new AbortController();
+  const onInterrupt = () => waiting.abort(new InterruptedError());
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+  for (const signal of signals) {
+    process.once(signal, onInterrupt);
+  }
+  const timeoutMs = options.timeoutMs;
+  const timeout =
+    timeoutMs != null && timeoutMs > 0
+      ? setTimeout(() => waiting.abort(new TimeoutError(timeoutMs)), timeoutMs)
+      : undefined;
+  const signal = options.waitSignal
+    ? AbortSignal.any([waiting.signal, options.waitSignal])
+    : waiting.signal;
+  try {
+    // Resolve aliases for the lock key only; read the authoritative record again after admission.
+    const { acpxRecordId } = await resolveSessionRecord(options.sessionRecordId);
+    const ownership = await acquireSessionTurn(acpxRecordId, signal);
+    return { recordId: acpxRecordId, ownership };
+  } catch (error) {
+    signal.throwIfAborted();
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    for (const signal of signals) {
+      process.off(signal, onInterrupt);
+    }
+  }
+}
+
 async function runSessionPrompt(options: RunSessionPromptOptions): Promise<SessionSendResult> {
+  let turn: Awaited<ReturnType<typeof waitForSessionTurn>>;
+  try {
+    turn = await waitForSessionTurn(options);
+  } catch (error) {
+    if (options.waitSignal?.aborted && error === options.waitSignal.reason) {
+      const record = await resolveSessionRecord(options.sessionRecordId);
+      return {
+        sessionId: record.acpxRecordId,
+        stopReason: "cancelled",
+        permissionStats: { requested: 0, approved: 0, denied: 0, cancelled: 0 },
+        record,
+        resumed: false,
+      };
+    }
+    throw error;
+  }
+  try {
+    return await runOwnedSessionPrompt({ ...options, sessionRecordId: turn.recordId });
+  } finally {
+    await turn.ownership[Symbol.asyncDispose]();
+  }
+}
+
+async function runOwnedSessionPrompt(options: RunSessionPromptOptions): Promise<SessionSendResult> {
   const stopTotalTimer = startPerfTimer("runtime.prompt.total");
   const output = options.outputFormatter;
   const shouldMarkAcpErrorsEmitted = rendersAcpErrors(options.errorEmissionPolicy);
@@ -754,7 +778,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     },
   });
 
-  const ownClient = options.client == null;
+  let closeClientOnExit = options.client == null;
   const client =
     options.client ??
     new AcpClient({
@@ -828,36 +852,18 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     setSessionModel: async (modelId: string) => {
       const models = advertisedModelState(acpxState);
       const response = await client.setSessionModel(activeSessionIdForControl, modelId, models);
-      acpxState = applyConfigOptionResponseToState(acpxState, response);
-      const nextState = cloneSessionAcpxState(acpxState) ?? {};
-      nextState.session_options = { ...nextState.session_options, model: modelId };
-      nextState.current_model_id = currentModelIdFromSetModelResponse(response, modelId);
-      clearDesiredConfigOption(nextState, models?.configId);
-      acpxState = nextState;
+      acpxState = applyModelSelection(acpxState, modelId, response);
       return response;
     },
     setSessionConfigOption: async (configId: string, value: string) => {
+      // Preserve the selected control's identity across pre-ack notifications.
+      const modelConfigId = advertisedModelState(acpxState)?.configId;
       const response = await client.setSessionConfigOption(
         activeSessionIdForControl,
         configId,
         value,
       );
-      acpxState = applyConfigOptionResponseToState(acpxState, response);
-      const nextState = cloneSessionAcpxState(acpxState) ?? {};
-      const modelConfigId = modelStateFromConfigOptions(nextState.config_options)?.configId;
-      if (configId === modelConfigId) {
-        nextState.session_options = { ...nextState.session_options, model: value };
-        nextState.current_model_id = currentModelIdFromSetModelResponse(response, value);
-        clearDesiredConfigOption(nextState, configId);
-      } else if (configId === "mode") {
-        nextState.desired_mode_id = value;
-      } else {
-        nextState.desired_config_options = {
-          ...nextState.desired_config_options,
-          [configId]: value,
-        };
-      }
-      acpxState = nextState;
+      acpxState = applyConfigOptionSelection(acpxState, configId, value, response, modelConfigId);
       return response;
     },
   };
@@ -879,6 +885,9 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
           client,
           record,
           resumePolicy: options.resumePolicy,
+          replacingConfigOption: requestedModelId(options.sessionOptions?.model)
+            ? { key: "model" }
+            : undefined,
           timeoutMs: options.timeoutMs,
           verbose: options.verbose,
           suppressWarnings: options.suppressSdkConsoleErrors,
@@ -900,6 +909,8 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       emitConnectPerfMetric(connectStartedAt, options.verbose);
       return connected;
     } catch (error) {
+      // A shared queue client must reconnect after an incomplete preference replay.
+      closeClientOnExit = true;
       flushConnectOutput();
       throw error;
     }
@@ -1020,7 +1031,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await applyPromptModelIfAdvertised({
       client,
       sessionId: activeSessionId,
-      requestedModel: sessionOptions?.model,
+      requestedModel: options.sessionOptions?.model,
       record,
       timeoutMs: options.timeoutMs,
       suppressWarnings: options.suppressSdkConsoleErrors,
@@ -1036,7 +1047,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     promptTurnActive = false;
 
     return {
-      ...toPromptResult(response.stopReason, record.acpxRecordId, client),
+      ...toPromptResult(response.stopReason, record.acpxRecordId, client, response._meta),
       record,
       resumed,
       loadError,
@@ -1052,7 +1063,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
     await flushPendingMessages(false).catch(() => {
       // best effort while process is being interrupted
     });
-    if (ownClient) {
+    if (closeClientOnExit) {
       await client.close();
     }
   };
@@ -1078,7 +1089,7 @@ async function runSessionPrompt(options: RunSessionPromptOptions): Promise<Sessi
       options.onClientClosed?.();
     }
     client.clearEventHandlers();
-    if (ownClient) {
+    if (closeClientOnExit) {
       await client.close();
     }
     applyLifecycleSnapshotToRecord(record, client.getAgentLifecycleSnapshot());
@@ -1192,6 +1203,12 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
             ? undefined
             : (message) => process.stderr.write(`[acpx] warning: ${message}\n`),
         });
+        for (const configOption of options.configOptions ?? []) {
+          await withTimeout(
+            client.setSessionConfigOption(sessionId, configOption.configId, configOption.value),
+            options.timeoutMs,
+          );
+        }
 
         output.setContext({
           sessionId,
@@ -1200,7 +1217,7 @@ export async function runOnce(options: RunOnceOptions): Promise<RunPromptResult>
         const response = await runExecPromptWithRetries(sessionId);
         promptTurnActive = false;
         output.flush();
-        return toPromptResult(response.stopReason, sessionId, client);
+        return toPromptResult(response.stopReason, sessionId, client, response._meta);
       },
       async () => {
         await client.cancelActivePrompt(INTERRUPT_CANCEL_WAIT_MS);
