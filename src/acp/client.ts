@@ -61,7 +61,6 @@ import {
   resolvePermissionRequestWithDetails,
 } from "../permissions.js";
 import { getUnsupportedPromptContentMessage, textPrompt } from "../prompt-content.js";
-import { extractRuntimeSessionId } from "../session/runtime-session-id.js";
 import { buildAgentSpawnCommand, buildSpawnCommandOptions } from "../spawn-command-options.js";
 import type {
   AcpClientOptions,
@@ -95,6 +94,7 @@ import {
   resolveGeminiCommandArgs,
   shouldIgnoreNonJsonAgentOutputLine,
 } from "./agent-command.js";
+import { extractAgentSessionId } from "./agent-session-id.js";
 import {
   buildAgentSpawnOptions,
   readEnvCredential,
@@ -263,7 +263,7 @@ function toReconnectedSessionResult(
 ): SessionLoadResult {
   const configOptions = normalizeResponseConfigOptions(response);
   return {
-    agentSessionId: extractRuntimeSessionId(response?._meta),
+    agentSessionId: extractAgentSessionId(response?._meta),
     configOptions,
     models: modelStateFromSessionResponse({ configOptions, response }),
     configOptionsPresent: hasResponseField(response, "configOptions"),
@@ -1082,7 +1082,7 @@ export class AcpClient {
 
     return {
       sessionId: result.sessionId,
-      agentSessionId: extractRuntimeSessionId(result._meta),
+      agentSessionId: extractAgentSessionId(result._meta),
       configOptions,
       models,
       configOptionsPresent: hasResponseField(result, "configOptions"),
