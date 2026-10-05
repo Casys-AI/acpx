@@ -1,3 +1,10 @@
+> [!NOTE]
+> **Archived Casys fork.**
+> For Erwan Lee Pesle's development and contributions, use
+> [superWorldSavior/acpx](https://github.com/superWorldSavior/acpx).
+> The upstream project is [openclaw/acpx](https://github.com/openclaw/acpx).
+> This repository is retained to preserve the former Casys fork and its GitHub history.
+
 # acpx 🤝 — Agents talking to agents, minus the terminal séance
 
 <p align="center">
